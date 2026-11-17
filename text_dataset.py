@@ -1,7 +1,8 @@
 import torch
 from torch.utils.data import Dataset
+from datasets import load_dataset
 
-class VerdictDataset(Dataset):
+class TextDataset(Dataset):
     def __init__(self, text, tokenizer, max_length, stride):
         self.input_ids = []
         self.target_ids = []
