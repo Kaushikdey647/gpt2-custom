@@ -116,23 +116,23 @@ def plot_losses(epochs_seen, tokens_seen, train_losses, val_losses):
     plt.show()
 
 def calc_loss_loader(data_loader, model, device, num_batches=None):
-    total_loss = 0.0
-    if(len(data_loader) == 0):
-        return 0.0
-    elif num_batches is None:
+    if len(data_loader) == 0:
+        print("Warning: empty data loader — returning nan loss")
+        return float("nan")
+    if num_batches is None:
         num_batches = len(data_loader)
     else:
         num_batches = min(num_batches, len(data_loader))
-    
+
+    total_loss = 0.0
     for i, (input_batch, target_batch) in enumerate(data_loader):
-        if i < num_batches:
-            loss = calc_loss_batch(input_batch, target_batch, model, device)
-            total_loss += loss.item()
-        else:
+        if i >= num_batches:
             break
+        loss = calc_loss_batch(input_batch, target_batch, model, device)
+        total_loss += loss.item()
     return total_loss / num_batches
 
-def evaluate_model(model, train_loader, val_loader, device, eval_iter, start_context, tokenizer):
+def evaluate_model(model, train_loader, val_loader, device, eval_iter):
     model.eval()
     with torch.no_grad():
         train_loss = calc_loss_loader(train_loader, model, device, eval_iter)
@@ -150,54 +150,108 @@ def generate_and_print_sample(model: GPTModel, tokenizer, device, start_context)
     print(f"Generated Text: {decoded_text.replace('<|endoftext|>', '').replace('\n', ' ').strip()}")
     model.train()
 
-def create_path_if_not_exists(model_name):
-    path = "model-data/"
-    if not os.path.exists(path):
-        os.makedirs(path)
-    path = path + model_name + ".pt"
+def checkpoint_path(model_name):
+    os.makedirs("model-data", exist_ok=True)
+    return os.path.join("model-data", f"{model_name}.pt")
+
+def save_checkpoint(
+    path,
+    model,
+    optimizer,
+    epoch,
+    global_step,
+    tokens_seen,
+    train_loss,
+    val_loss,
+    train_losses,
+    val_losses,
+    track_tokens_seen,
+    config,
+):
+    torch.save(
+        {
+            "epoch": epoch,
+            "global_step": global_step,
+            "tokens_seen": tokens_seen,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+            "train_losses": train_losses,
+            "val_losses": val_losses,
+            "track_tokens_seen": track_tokens_seen,
+            "config": config,
+        },
+        path,
+    )
+    print(f"Saved checkpoint: {path}")
+
+def load_checkpoint(path, model, optimizer, device, config=None):
     if not os.path.exists(path):
         return None
-    return path
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
+    if config is not None and "config" in checkpoint:
+        for key in ("vocab_size", "context_length", "embedding_dim", "num_heads", "num_layers"):
+            if key in checkpoint["config"] and checkpoint["config"][key] != config.get(key):
+                raise ValueError(
+                    f"Checkpoint config mismatch for {key}: "
+                    f"{checkpoint['config'][key]} vs {config.get(key)}"
+                )
+    model.load_state_dict(checkpoint["model_state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    # Keep optimizer state on the training device
+    for state in optimizer.state.values():
+        for k, v in state.items():
+            if isinstance(v, torch.Tensor):
+                state[k] = v.to(device)
+    print(f"Loaded checkpoint: {path} (epoch={checkpoint['epoch']}, step={checkpoint['global_step']})")
+    return checkpoint
 
-def save_model(model, model_name, epoch, optimizer, loss):
-    path = create_path_if_not_exists(model_name, epoch)
-    if path is not None:
-        print("Overwriting Existing Model")
-    else:
-        print("Saving New Model")
-    torch.save({
-        'epoch': epoch,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'loss': loss
-    }, path)
+def train_model_simple(
+    model,
+    train_loader,
+    val_loader,
+    optimizer,
+    device,
+    num_epochs,
+    eval_freq,
+    eval_iter,
+    start_context,
+    tokenizer,
+    model_name,
+    config=None,
+    grad_clip=1.0,
+):
+    model.to(device)
+    path = checkpoint_path(model_name)
 
-def load_model(model, optimizer,model_name):
-    path = create_path_if_not_exists(model_name)
-    if path is None:
-        return model, optimizer, None, None
-    checkpoint = torch.load(path)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    epoch = checkpoint['epoch']
-    loss = checkpoint['loss']
-    return model, optimizer, loss, epoch
-
-
-def train_model_simple(model, train_loader, val_loader, optimizer, device, num_epochs, eval_freq, eval_iter, start_context, tokenizer, model_name):
     train_losses = []
     val_losses = []
     track_tokens_seen = []
     tokens_seen = 0
     global_step = -1
-    model, optimizer, loss, epoch_loaded = load_model(model, optimizer, model_name)
-    model.to(device)
-    if epoch_loaded is None:
-        epoch_loaded = 0
-    else:
-        epoch_loaded = epoch_loaded + 1
-    for epoch in range(epoch_loaded, num_epochs):
-        print(f"Epoch {epoch+1}/{num_epochs}")
+    start_epoch = 0
+    train_loss = float("nan")
+    val_loss = float("nan")
+
+    checkpoint = load_checkpoint(path, model, optimizer, device, config)
+    if checkpoint is not None:
+        # epoch in checkpoint is the last fully completed epoch
+        start_epoch = checkpoint["epoch"] + 1
+        global_step = checkpoint["global_step"]
+        tokens_seen = checkpoint["tokens_seen"]
+        train_losses = list(checkpoint.get("train_losses", []))
+        val_losses = list(checkpoint.get("val_losses", []))
+        track_tokens_seen = list(checkpoint.get("track_tokens_seen", []))
+        train_loss = checkpoint.get("train_loss", float("nan"))
+        val_loss = checkpoint.get("val_loss", float("nan"))
+        if start_epoch >= num_epochs:
+            print(f"Checkpoint already finished all {num_epochs} epochs — nothing to train.")
+            return train_losses, val_losses, track_tokens_seen
+        print(f"Resuming from epoch {start_epoch + 1}/{num_epochs}")
+
+    for epoch in range(start_epoch, num_epochs):
+        print(f"Epoch {epoch + 1}/{num_epochs}")
         print("-" * 10)
         print("Training...")
         model.train()
@@ -205,22 +259,41 @@ def train_model_simple(model, train_loader, val_loader, optimizer, device, num_e
             optimizer.zero_grad()
             loss = calc_loss_batch(input_batch, target_batch, model, device)
             loss.backward()
+            if grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
             tokens_seen += input_batch.numel()
             global_step += 1
 
             if global_step % eval_freq == 0:
-                train_loss, val_loss = evaluate_model(model, train_loader, val_loader, device, eval_iter, start_context, tokenizer)
+                train_loss, val_loss = evaluate_model(
+                    model, train_loader, val_loader, device, eval_iter
+                )
                 train_losses.append(train_loss)
                 val_losses.append(val_loss)
                 track_tokens_seen.append(tokens_seen)
-
-                print(f"Epoch {epoch+1}/{num_epochs}, Step {global_step}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
+                print(
+                    f"Epoch {epoch + 1}/{num_epochs}, Step {global_step}, "
+                    f"Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}"
+                )
                 print(f"Tokens Seen: {tokens_seen}")
-                print("-" * 10)
-            
-        generate_and_print_sample(model, tokenizer, device, start_context)
+                print("-" * 50)
 
-        save_model(model, model_name, epoch, optimizer, loss)
-    
+        generate_and_print_sample(model, tokenizer, device, start_context)
+        # Save only after the full epoch finishes; resume starts at epoch + 1
+        save_checkpoint(
+            path,
+            model,
+            optimizer,
+            epoch,
+            global_step,
+            tokens_seen,
+            train_loss,
+            val_loss,
+            train_losses,
+            val_losses,
+            track_tokens_seen,
+            config,
+        )
+
     return train_losses, val_losses, track_tokens_seen
