@@ -3,11 +3,13 @@ import tiktoken
 import torch.nn as nn
 from torch.utils.backcompat import keepdim_warning
 from torch.utils.data import DataLoader
+from datasets import load_dataset
 from models import GPTModel
 from text_dataset import TextDataset
 from basic_tokenizer import Tokenizer
 import matplotlib.pyplot as plt
 from matplotlib.ticker import MaxNLocator
+import os
 
 def start_emb_layer(vocab_size,output_dim):
     emb_layer = torch.nn.Embedding(vocab_size,output_dim)
@@ -30,10 +32,35 @@ def create_dataloader_v1(text, batch_size=4, max_length=256, stride=128, num_wor
     )
     return dataloader
 
-def create_dataloader_v2(text, config: dict):
+def create_dataloader_v2(text, config: dict, shuffle=True, drop_last=True):
     tokenizer = tiktoken.get_encoding("gpt2")
-    dataset = TextDataset(text, tokenizer, config["context_length"], config["context_length"] // 2)
-    return DataLoader(dataset, batch_size=config["batch_size"], shuffle=True, num_workers=0, drop_last=True)
+    dataset = TextDataset(text, tokenizer, config["context_length"], config["stride"])
+    return DataLoader(dataset, batch_size=config["batch_size"], shuffle=shuffle, num_workers=0, drop_last=drop_last)
+
+def create_dataloader_cosmopedia(
+    config: dict,
+    subset: str = "stanford",
+    max_samples: int = 5000,
+    val_ratio: float = 0.1,
+    seed: int = 123,
+):
+    """LM dataloaders from Cosmopedia `text` column.
+
+    Full stanford split is ~1M rows — subset first. Only `train` exists, so we
+    carve out val. Docs are joined with <|endoftext|> then windowed like v2.
+    """
+    n = max_samples
+    raw = load_dataset("HuggingFaceTB/cosmopedia", subset, split="train")
+    raw = raw.shuffle(seed=seed).select(range(min(n, len(raw))))
+    split = raw.train_test_split(test_size=val_ratio, seed=seed)
+
+    train_text = "<|endoftext|>".join(split["train"]["text"])
+    val_text = "<|endoftext|>".join(split["test"]["text"])
+
+    train_loader = create_dataloader_v2(train_text, config, shuffle=True, drop_last=True)
+    # drop_last=False so a small val set still yields batches
+    val_loader = create_dataloader_v2(val_text, config, shuffle=False, drop_last=False)
+    return train_loader, val_loader
 
 def generate_text_simple(model, idx, max_new_tokens, context_size, temperature=1.0):
     # For a simple text generation, lets generate the text token by token
@@ -123,14 +150,53 @@ def generate_and_print_sample(model: GPTModel, tokenizer, device, start_context)
     print(f"Generated Text: {decoded_text.replace('<|endoftext|>', '').replace('\n', ' ').strip()}")
     model.train()
 
-def train_model_simple(model, train_loader, val_loader, optimizer, device, num_epochs, eval_freq, eval_iter, start_context, tokenizer):
+def create_path_if_not_exists(model_name):
+    path = "model-data/"
+    if not os.path.exists(path):
+        os.makedirs(path)
+    path = path + model_name + ".pt"
+    if not os.path.exists(path):
+        return None
+    return path
+
+def save_model(model, model_name, epoch, optimizer, loss):
+    path = create_path_if_not_exists(model_name, epoch)
+    if path is not None:
+        print("Overwriting Existing Model")
+    else:
+        print("Saving New Model")
+    torch.save({
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'loss': loss
+    }, path)
+
+def load_model(model, optimizer,model_name):
+    path = create_path_if_not_exists(model_name)
+    if path is None:
+        return model, optimizer, None, None
+    checkpoint = torch.load(path)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    epoch = checkpoint['epoch']
+    loss = checkpoint['loss']
+    return model, optimizer, loss, epoch
+
+
+def train_model_simple(model, train_loader, val_loader, optimizer, device, num_epochs, eval_freq, eval_iter, start_context, tokenizer, model_name):
     train_losses = []
     val_losses = []
     track_tokens_seen = []
     tokens_seen = 0
     global_step = -1
+    model, optimizer, loss, epoch_loaded = load_model(model, optimizer, model_name)
     model.to(device)
-    for epoch in range(num_epochs):
+    if epoch_loaded is None:
+        epoch_loaded = 0
+    else:
+        epoch_loaded = epoch_loaded + 1
+    for epoch in range(epoch_loaded, num_epochs):
         print(f"Epoch {epoch+1}/{num_epochs}")
         print("-" * 10)
         print("Training...")
@@ -154,5 +220,7 @@ def train_model_simple(model, train_loader, val_loader, optimizer, device, num_e
                 print("-" * 10)
             
         generate_and_print_sample(model, tokenizer, device, start_context)
+
+        save_model(model, model_name, epoch, optimizer, loss)
     
     return train_losses, val_losses, track_tokens_seen

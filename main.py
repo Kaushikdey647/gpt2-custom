@@ -1,23 +1,24 @@
 import tiktoken
 import torch
 from models import GPTModel
-from utils import get_text, create_dataloader_v2, train_model_simple, generate_and_print_sample, plot_losses
+from utils import train_model_simple, generate_and_print_sample, plot_losses, create_dataloader_cosmopedia
 
 def main():
 
     # Set up the configuration for the model
     GPT_CONFIG_124M = {
         "vocab_size": 50257, # Vocabulary size
-        "context_length": 128, # Context length
+        "context_length": 64, # Context length
+        "stride": 64, # Stride
         "embedding_dim": 768, # Embedding dimension
         "num_heads": 12, # Number of attention heads
         "num_layers": 12, # Number of layers
         "dropout_rate": 0.1, # Dropout rate
         "qkv_bias": False, # Query-Key-Value bias
         "batch_size": 8,
-        "learning_rate": 3e-4,
+        "learning_rate": 1e-4,
         "num_epochs": 5,
-        "start_context": "Israel is a"
+        "start_context": "Grief is"
     }
 
     # Set up the seed for the random number generator
@@ -29,21 +30,7 @@ def main():
     # Model for the GPT-2 architecture
     model = GPTModel(GPT_CONFIG_124M)
 
-    # Get the text data from the file
-    text_data = get_text()
-
-    tokenized_text = tokenizer.encode(text_data)
-    print("Total tokens: ", len(tokenized_text))
-
-    total_chars = len(text_data)
-
-    # Split the text data into training and validation sets
-    train_split = 0.9
-    split_idx = int(total_chars * train_split)
-
-    # Create the dataloaders for the training and validation sets
-    train_loader = create_dataloader_v2(text_data[:split_idx], GPT_CONFIG_124M)
-    val_loader = create_dataloader_v2(text_data[split_idx:], GPT_CONFIG_124M)
+    train_loader, val_loader = create_dataloader_cosmopedia(GPT_CONFIG_124M, subset="stanford", max_samples=5000, val_ratio=0.1, seed=123)
 
     # Set the device for the model
     if torch.cuda.is_available():
@@ -53,6 +40,7 @@ def main():
     else:
         device = torch.device("cpu")
     print(f"Using device: {device}")
+
     model.to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=GPT_CONFIG_124M["learning_rate"])
@@ -68,10 +56,11 @@ def main():
         optimizer=optimizer,
         device=device,
         num_epochs=GPT_CONFIG_124M["num_epochs"],
-        eval_freq=5,
+        eval_freq=100,
         eval_iter=10,
         start_context="Every effort moves you",
-        tokenizer=tokenizer
+        tokenizer=tokenizer,
+        model_name="gpt-2-124m"
     )
     epochs_tensor = torch.linspace(0, GPT_CONFIG_124M["num_epochs"], len(train_losses))
     plot_losses(epochs_tensor, track_tokens_seen, train_losses, val_losses)
