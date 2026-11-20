@@ -2,14 +2,17 @@ import os
 
 import tiktoken
 import torch
+
 from models import GPTModel
+from text_dataset import create_dataloader_cosmopedia
 from utils import (
     checkpoint_path,
-    create_dataloader_cosmopedia,
     generate_and_print_sample,
+    get_device,
     plot_losses,
     train_model_simple,
 )
+
 
 def main():
     GPT_CONFIG_124M = {
@@ -35,12 +38,7 @@ def main():
         GPT_CONFIG_124M, subset="stanford", max_samples=5000, val_ratio=0.1, seed=123
     )
 
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif torch.backends.mps.is_available():
-        device = torch.device("mps")
-    else:
-        device = torch.device("cpu")
+    device = get_device()
     print(f"Using device: {device}")
     model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=GPT_CONFIG_124M["learning_rate"])
@@ -72,6 +70,7 @@ def main():
     print("Great, now give a sentence for it to complete: ")
     start_context = input()
     generate_and_print_sample(model, tokenizer, device, start_context)
+
 
 if __name__ == "__main__":
     main()

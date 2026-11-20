@@ -1,110 +1,58 @@
-import torch
-import tiktoken
-import torch.nn as nn
-from torch.utils.backcompat import keepdim_warning
-from torch.utils.data import DataLoader
-from datasets import load_dataset
-from models import GPTModel
-from text_dataset import TextDataset
-from basic_tokenizer import Tokenizer
-import matplotlib.pyplot as plt
-from matplotlib.ticker import MaxNLocator
 import os
 
-def start_emb_layer(vocab_size,output_dim):
-    emb_layer = torch.nn.Embedding(vocab_size,output_dim)
-    return emb_layer
+import matplotlib.pyplot as plt
+import torch
+from huggingface_hub import hf_hub_download
+from matplotlib.ticker import MaxNLocator
 
-def get_text():
-    with open("the-text.txt", "r") as file:
-        text = file.read()
-    return text
+from models import GPTModel
+from text_dataset import IGNORE_INDEX
 
-def create_dataloader_v1(text, batch_size=4, max_length=256, stride=128, num_workers=0, shuffle=True, drop_last=True):
-    tokenizer = Tokenizer()
-    dataset = TextDataset(text, tokenizer, max_length, stride)
-    dataloader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
-        drop_last=drop_last,
-    )
-    return dataloader
 
-def create_dataloader_v2(text, config: dict, shuffle=True, drop_last=True):
-    tokenizer = tiktoken.get_encoding("gpt2")
-    dataset = TextDataset(text, tokenizer, config["context_length"], config["stride"])
-    return DataLoader(dataset, batch_size=config["batch_size"], shuffle=shuffle, num_workers=0, drop_last=drop_last)
+def get_device():
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
 
-def create_dataloader_cosmopedia(
-    config: dict,
-    subset: str = "stanford",
-    max_samples: int = 5000,
-    val_ratio: float = 0.1,
-    seed: int = 123,
-):
-    """LM dataloaders from Cosmopedia `text` column.
-
-    Full stanford split is ~1M rows — subset first. Only `train` exists, so we
-    carve out val. Docs are joined with <|endoftext|> then windowed like v2.
-    """
-    n = max_samples
-    raw = load_dataset("HuggingFaceTB/cosmopedia", subset, split="train")
-    raw = raw.shuffle(seed=seed).select(range(min(n, len(raw))))
-    split = raw.train_test_split(test_size=val_ratio, seed=seed)
-
-    train_text = "<|endoftext|>".join(split["train"]["text"])
-    val_text = "<|endoftext|>".join(split["test"]["text"])
-
-    train_loader = create_dataloader_v2(train_text, config, shuffle=True, drop_last=True)
-    # drop_last=False so a small val set still yields batches
-    val_loader = create_dataloader_v2(val_text, config, shuffle=False, drop_last=False)
-    return train_loader, val_loader
 
 def generate_text_simple(model, idx, max_new_tokens, context_size, temperature=1.0):
-    # For a simple text generation, lets generate the text token by token
     for _ in range(max_new_tokens):
-        # Crop the input to the context size
         idx_cropped = idx[:, -context_size:]
         with torch.no_grad():
-            # Forward pass and get the logits
             logits = model(idx_cropped)
-            # Divide the logits by the temperature
             logits = logits[:, -1, :] / temperature
-            # Apply the softmax function to get the probabilities of each token
             probs = torch.softmax(logits, dim=-1)
-            # Argmax chooses the most likely next token
             idx_next = torch.argmax(probs, dim=-1, keepdim=True)
-            # Concatenate the next token to the input
             idx = torch.cat((idx, idx_next), dim=1)
     return idx
 
+
 def text_to_token_ids(text, tokenizer):
     encoded = tokenizer.encode(text, allowed_special={"<|endoftext|>"})
-    encoded_tensor = torch.tensor(encoded).unsqueeze(0) # Creates the batch dimension
-    return encoded_tensor
+    return torch.tensor(encoded).unsqueeze(0)
+
 
 def token_ids_to_text(token_ids, tokenizer):
-    text = tokenizer.decode(token_ids.squeeze(0).tolist())
-    return text
+    return tokenizer.decode(token_ids.squeeze(0).tolist())
+
 
 def calc_loss_batch(input_batch, target_batch, model, device):
     input_batch = input_batch.to(device)
     target_batch = target_batch.to(device)
     logits = model(input_batch)
-    loss = torch.nn.functional.cross_entropy(
+    return torch.nn.functional.cross_entropy(
         logits.flatten(0, 1),
-        target_batch.flatten()
+        target_batch.flatten(),
+        ignore_index=IGNORE_INDEX,
     )
-    return loss
+
 
 def plot_losses(epochs_seen, tokens_seen, train_losses, val_losses):
     fig, ax1 = plt.subplots(figsize=(5, 3))
     ax1.plot(epochs_seen, train_losses, label="Training loss")
-    ax1.plot(
-    epochs_seen, val_losses, linestyle="-.", label="Validation loss"
-    )
+    ax1.plot(epochs_seen, val_losses, linestyle="-.", label="Validation loss")
     ax1.set_xlabel("Epochs")
     ax1.set_ylabel("Loss")
     ax1.legend(loc="upper right")
@@ -114,6 +62,7 @@ def plot_losses(epochs_seen, tokens_seen, train_losses, val_losses):
     ax2.set_xlabel("Tokens seen")
     fig.tight_layout()
     plt.show()
+
 
 def calc_loss_loader(data_loader, model, device, num_batches=None):
     if len(data_loader) == 0:
@@ -128,9 +77,9 @@ def calc_loss_loader(data_loader, model, device, num_batches=None):
     for i, (input_batch, target_batch) in enumerate(data_loader):
         if i >= num_batches:
             break
-        loss = calc_loss_batch(input_batch, target_batch, model, device)
-        total_loss += loss.item()
+        total_loss += calc_loss_batch(input_batch, target_batch, model, device).item()
     return total_loss / num_batches
+
 
 def evaluate_model(model, train_loader, val_loader, device, eval_iter):
     model.eval()
@@ -140,19 +89,24 @@ def evaluate_model(model, train_loader, val_loader, device, eval_iter):
     model.train()
     return train_loss, val_loss
 
+
 def generate_and_print_sample(model: GPTModel, tokenizer, device, start_context):
     model.eval()
     context_size = model.position_embedding.weight.shape[0]
     encoded = text_to_token_ids(start_context, tokenizer).to(device)
     with torch.no_grad():
         token_ids = generate_text_simple(model, encoded, max_new_tokens=50, context_size=context_size)
-    decoded_text = token_ids_to_text(token_ids, tokenizer)
-    print(f"Generated Text: {decoded_text.replace('<|endoftext|>', '').replace('\n', ' ').strip()}")
+    generated = token_ids_to_text(token_ids[:, encoded.shape[1] :], tokenizer)
+    generated = generated.split("<|endoftext|>", 1)[0].strip()
+    print(f"Prompt: {start_context.strip()}")
+    print(f"Generated: {generated or '(empty)'}")
     model.train()
+
 
 def checkpoint_path(model_name):
     os.makedirs("model-data", exist_ok=True)
     return os.path.join("model-data", f"{model_name}.pt")
+
 
 def save_checkpoint(
     path,
@@ -186,6 +140,7 @@ def save_checkpoint(
     )
     print(f"Saved checkpoint: {path}")
 
+
 def load_checkpoint(path, model, optimizer, device, config=None):
     if not os.path.exists(path):
         return None
@@ -199,13 +154,92 @@ def load_checkpoint(path, model, optimizer, device, config=None):
                 )
     model.load_state_dict(checkpoint["model_state_dict"])
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-    # Keep optimizer state on the training device
     for state in optimizer.state.values():
         for k, v in state.items():
             if isinstance(v, torch.Tensor):
                 state[k] = v.to(device)
     print(f"Loaded checkpoint: {path} (epoch={checkpoint['epoch']}, step={checkpoint['global_step']})")
     return checkpoint
+
+
+def load_pretrained_weights(model, path, device):
+    """Load base-model weights into a model that may have a longer context.
+
+    Attention masks are rebuilt by the new model, and position embeddings beyond
+    the base context keep their fresh init. Optimizer/epoch state is not loaded.
+    """
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"No pretrained checkpoint at {path}")
+    state = torch.load(path, map_location=device, weights_only=False)["model_state_dict"]
+    state = {k: v for k, v in state.items() if not k.endswith(".mask")}
+
+    base_pos = state.pop("position_embedding.weight")
+    new_pos = model.position_embedding.weight
+    if base_pos.shape[0] > new_pos.shape[0] or base_pos.shape[1] != new_pos.shape[1]:
+        raise ValueError(
+            f"Cannot fit base position embedding {tuple(base_pos.shape)} into {tuple(new_pos.shape)}"
+        )
+    with torch.no_grad():
+        new_pos[: base_pos.shape[0]].copy_(base_pos)
+
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    missing = [k for k in missing if not k.endswith(".mask") and k != "position_embedding.weight"]
+    if missing or unexpected:
+        raise ValueError(f"Pretrained weight mismatch. missing={missing} unexpected={unexpected}")
+    print(f"Loaded pretrained weights: {path} (base context {base_pos.shape[0]} -> {new_pos.shape[0]})")
+
+
+def load_openai_gpt2_weights(model, device, repo_id="openai-community/gpt2"):
+    """Download OpenAI GPT-2 weights from the HF Hub and copy them into GPTModel.
+
+    Model config must match GPT-2: qkv_bias=True, same width/heads/layers, and
+    context_length <= 1024 (position embeddings are sliced to fit).
+    """
+    path = hf_hub_download(repo_id, "pytorch_model.bin")
+    sd = torch.load(path, map_location="cpu", weights_only=True)
+    sd = {k.removeprefix("transformer."): v for k, v in sd.items()}
+
+    def copy(param, value):
+        if param.shape != value.shape:
+            raise ValueError(f"Shape mismatch: {tuple(param.shape)} vs {tuple(value.shape)}")
+        with torch.no_grad():
+            param.copy_(value)
+
+    ctx = model.position_embedding.weight.shape[0]
+    copy(model.token_embedding.weight, sd["wte.weight"])
+    copy(model.position_embedding.weight, sd["wpe.weight"][:ctx])
+    copy(model.out_head.weight, sd["wte.weight"])
+    copy(model.final_norm.scale, sd["ln_f.weight"])
+    copy(model.final_norm.shift, sd["ln_f.bias"])
+
+    for i, block in enumerate(model.transformer_blocks):
+        p = f"h.{i}."
+        q_w, k_w, v_w = sd[p + "attn.c_attn.weight"].T.chunk(3, dim=0)
+        q_b, k_b, v_b = sd[p + "attn.c_attn.bias"].chunk(3)
+        attn = block.attention
+        copy(attn.W_q.weight, q_w)
+        copy(attn.W_k.weight, k_w)
+        copy(attn.W_v.weight, v_w)
+        copy(attn.W_q.bias, q_b)
+        copy(attn.W_k.bias, k_b)
+        copy(attn.W_v.bias, v_b)
+        copy(attn.out_proj.weight, sd[p + "attn.c_proj.weight"].T)
+        copy(attn.out_proj.bias, sd[p + "attn.c_proj.bias"])
+
+        ff = block.feed_forward.layers
+        copy(ff[0].weight, sd[p + "mlp.c_fc.weight"].T)
+        copy(ff[0].bias, sd[p + "mlp.c_fc.bias"])
+        copy(ff[2].weight, sd[p + "mlp.c_proj.weight"].T)
+        copy(ff[2].bias, sd[p + "mlp.c_proj.bias"])
+
+        copy(block.norm1.scale, sd[p + "ln_1.weight"])
+        copy(block.norm1.shift, sd[p + "ln_1.bias"])
+        copy(block.norm2.scale, sd[p + "ln_2.weight"])
+        copy(block.norm2.shift, sd[p + "ln_2.bias"])
+
+    model.to(device)
+    print(f"Loaded OpenAI GPT-2 weights from {repo_id} (context {ctx})")
+
 
 def train_model_simple(
     model,
@@ -236,7 +270,6 @@ def train_model_simple(
 
     checkpoint = load_checkpoint(path, model, optimizer, device, config)
     if checkpoint is not None:
-        # epoch in checkpoint is the last fully completed epoch
         start_epoch = checkpoint["epoch"] + 1
         global_step = checkpoint["global_step"]
         tokens_seen = checkpoint["tokens_seen"]
@@ -280,7 +313,6 @@ def train_model_simple(
                 print("-" * 50)
 
         generate_and_print_sample(model, tokenizer, device, start_context)
-        # Save only after the full epoch finishes; resume starts at epoch + 1
         save_checkpoint(
             path,
             model,
