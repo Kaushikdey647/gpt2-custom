@@ -1,20 +1,25 @@
+import argparse
 import os
 
 import tiktoken
 import torch
 
-from models import GPTModel
-from text_dataset import create_dataloader_cosmopedia
+from text_dataset import create_dataloader_cosmopedia, create_dataloader_cosmopedia_full
 from utils import (
+    build_model,
     checkpoint_path,
     generate_and_print_sample,
     get_device,
-    plot_losses,
+    print_training_summary,
     train_model_simple,
 )
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--full", action="store_true", help="Train on the entire cosmopedia stanford subset")
+    args = parser.parse_args()
+
     GPT_CONFIG_124M = {
         "vocab_size": 50257,
         "context_length": 64,
@@ -30,17 +35,22 @@ def main():
         "start_context": "In this chapter",
     }
     model_name = "gpt-2-124m"
+    if args.full:
+        model_name += "-full"
 
     torch.manual_seed(123)
     tokenizer = tiktoken.get_encoding("gpt2")
-    model = GPTModel(GPT_CONFIG_124M)
-    train_loader, val_loader = create_dataloader_cosmopedia(
-        GPT_CONFIG_124M, subset="stanford", max_samples=5000, val_ratio=0.1, seed=123
-    )
+    model = build_model(GPT_CONFIG_124M)
+    if args.full:
+        train_loader, val_loader = create_dataloader_cosmopedia_full(GPT_CONFIG_124M, subset="stanford")
+    else:
+        train_loader, val_loader = create_dataloader_cosmopedia(
+            GPT_CONFIG_124M, subset="stanford", max_samples=5000, val_ratio=0.1, seed=123
+        )
 
     device = get_device()
-    print(f"Using device: {device}")
     model.to(device)
+    print_training_summary(model, GPT_CONFIG_124M, device, train_loader, val_loader, model_name)
     optimizer = torch.optim.AdamW(model.parameters(), lr=GPT_CONFIG_124M["learning_rate"])
 
     if os.path.exists(checkpoint_path(model_name)):
@@ -49,7 +59,7 @@ def main():
         print("Untrained model sample:")
         generate_and_print_sample(model, tokenizer, device, GPT_CONFIG_124M["start_context"])
 
-    train_losses, val_losses, track_tokens_seen = train_model_simple(
+    train_model_simple(
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
@@ -63,13 +73,7 @@ def main():
         model_name=model_name,
         config=GPT_CONFIG_124M,
     )
-    if train_losses:
-        epochs_tensor = torch.linspace(0, GPT_CONFIG_124M["num_epochs"], len(train_losses))
-        plot_losses(epochs_tensor, track_tokens_seen, train_losses, val_losses)
-
-    print("Great, now give a sentence for it to complete: ")
-    start_context = input()
-    generate_and_print_sample(model, tokenizer, device, start_context)
+    # Loss plot is saved next to the checkpoint inside train_model_simple
 
 
 if __name__ == "__main__":

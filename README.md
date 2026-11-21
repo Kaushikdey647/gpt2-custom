@@ -16,6 +16,7 @@ Requires Python ≥ 3.13. Training picks CUDA → MPS → CPU automatically.
 | Script | Role |
 |--------|------|
 | `train_gpt2_cosmopedia.py` | Pretrain from scratch on Cosmopedia |
+| `train_gpt2_moe_cosmopedia.py` | Pretrain the 8-expert MoE variant from scratch on Cosmopedia |
 | `train_gpt2_gsm8k.py` | Fine-tune your Cosmopedia checkpoint on GSM8K |
 | `train_openai_gpt2_gsm8k.py` | Load OpenAI GPT-2 weights, then fine-tune on GSM8K |
 | `inference.py` | Interactive generation / chat from a saved checkpoint |

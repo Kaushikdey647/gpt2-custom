@@ -1,8 +1,10 @@
+import os
 import random
 
+import numpy as np
 import tiktoken
 import torch
-from datasets import load_dataset
+from datasets import concatenate_datasets, load_dataset
 from torch.utils.data import DataLoader, Dataset
 
 IGNORE_INDEX = -100
@@ -190,6 +192,24 @@ class TextDataset(Dataset):
         return self.input_ids[idx], self.target_ids[idx]
 
 
+class MemmapDataset(Dataset):
+    """Windowed LM dataset over a uint16 token file; nothing is held in RAM."""
+
+    def __init__(self, path, max_length, stride):
+        self.tokens = np.memmap(path, dtype=np.uint16, mode="r")
+        self.max_length = max_length
+        self.stride = stride
+        self.n = len(range(0, len(self.tokens) - max_length, stride))
+
+    def __len__(self):
+        return self.n
+
+    def __getitem__(self, idx):
+        i = idx * self.stride
+        chunk = torch.from_numpy(self.tokens[i : i + self.max_length + 1].astype(np.int64))
+        return chunk[:-1], chunk[1:]
+
+
 class ChatDataset(Dataset):
     """Single-turn instruction SFT dataset.
 
@@ -268,9 +288,21 @@ def create_dataloader_lm(text, config: dict, shuffle=True, drop_last=True):
     )
 
 
+def _load_cosmopedia(subsets, max_samples=None, seed=123):
+    """Load one or more Cosmopedia subsets and concatenate; max_samples applies per subset."""
+    subsets = [subsets] if isinstance(subsets, str) else list(subsets)
+    parts = []
+    for name in subsets:
+        ds = load_dataset("HuggingFaceTB/cosmopedia", name, split="train")
+        if max_samples is not None:
+            ds = ds.shuffle(seed=seed).select(range(min(max_samples, len(ds))))
+        parts.append(ds.select_columns(["text"]))
+    return concatenate_datasets(parts)
+
+
 def create_dataloader_cosmopedia(
     config: dict,
-    subset: str = "stanford",
+    subset="stanford",
     max_samples: int = 5000,
     val_ratio: float = 0.1,
     seed: int = 123,
@@ -280,8 +312,7 @@ def create_dataloader_cosmopedia(
     Full stanford split is ~1M rows — subset first. Only `train` exists, so we
     carve out val. Docs are joined with <|endoftext|> then windowed.
     """
-    raw = load_dataset("HuggingFaceTB/cosmopedia", subset, split="train")
-    raw = raw.shuffle(seed=seed).select(range(min(max_samples, len(raw))))
+    raw = _load_cosmopedia(subset, max_samples, seed).shuffle(seed=seed)
     split = raw.train_test_split(test_size=val_ratio, seed=seed)
 
     train_text = "<|endoftext|>".join(split["train"]["text"])
@@ -289,6 +320,49 @@ def create_dataloader_cosmopedia(
 
     train_loader = create_dataloader_lm(train_text, config, shuffle=True, drop_last=True)
     val_loader = create_dataloader_lm(val_text, config, shuffle=False, drop_last=False)
+    return train_loader, val_loader
+
+
+def _tokenize_to_bin(texts, path, batch_size=10_000):
+    """Tokenize an iterable of docs (<|endoftext|> after each) into a uint16 file."""
+    tokenizer = tiktoken.get_encoding("gpt2")
+    eot = tokenizer.eot_token
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        batch = []
+        for i, text in enumerate(texts, 1):
+            batch.append(text)
+            if len(batch) == batch_size:
+                for ids in tokenizer.encode_ordinary_batch(batch):
+                    np.array(ids + [eot], dtype=np.uint16).tofile(f)
+                batch = []
+                print(f"Tokenized {i} docs -> {path}")
+        for ids in tokenizer.encode_ordinary_batch(batch):
+            np.array(ids + [eot], dtype=np.uint16).tofile(f)
+    os.replace(tmp, path)
+
+
+def create_dataloader_cosmopedia_full(
+    config: dict,
+    subset="stanford",
+    val_ratio: float = 0.001,
+    seed: int = 123,
+    cache_dir: str = "data-cache",
+):
+    """Loaders over the entire Cosmopedia subset. Tokenizes once into cache_dir, then memory-maps."""
+    os.makedirs(cache_dir, exist_ok=True)
+    tag = subset if isinstance(subset, str) else "+".join(subset)
+    paths = {k: os.path.join(cache_dir, f"cosmopedia-{tag}-{k}.bin") for k in ("train", "val")}
+    if not all(os.path.exists(p) for p in paths.values()):
+        raw = _load_cosmopedia(subset)
+        split = raw.train_test_split(test_size=val_ratio, seed=seed)
+        for key, ds in (("val", split["test"]), ("train", split["train"])):
+            _tokenize_to_bin((row["text"] for row in ds), paths[key])
+
+    train_ds = MemmapDataset(paths["train"], config["context_length"], config["stride"])
+    val_ds = MemmapDataset(paths["val"], config["context_length"], config["stride"])
+    train_loader = DataLoader(train_ds, batch_size=config["batch_size"], shuffle=True, num_workers=0, drop_last=True)
+    val_loader = DataLoader(val_ds, batch_size=config["batch_size"], shuffle=False, num_workers=0, drop_last=False)
     return train_loader, val_loader
 
 

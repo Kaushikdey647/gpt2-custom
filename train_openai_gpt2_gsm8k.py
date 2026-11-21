@@ -10,7 +10,7 @@ from utils import (
     generate_and_print_sample,
     get_device,
     load_openai_gpt2_weights,
-    plot_losses,
+    print_training_summary,
     train_model_simple,
 )
 
@@ -45,8 +45,8 @@ def main():
     train_loader, val_loader = create_dataloader_gsm8k(GPT_CONFIG_124M)
 
     device = get_device()
-    print(f"Using device: {device}")
     model.to(device)
+    print_training_summary(model, GPT_CONFIG_124M, device, train_loader, val_loader, model_name)
     optimizer = torch.optim.AdamW(model.parameters(), lr=GPT_CONFIG_124M["learning_rate"])
 
     if os.path.exists(checkpoint_path(model_name)):
@@ -70,9 +70,7 @@ def main():
         model_name=model_name,
         config=GPT_CONFIG_124M,
     )
-    if train_losses:
-        epochs_tensor = torch.linspace(0, GPT_CONFIG_124M["num_epochs"], len(train_losses))
-        plot_losses(epochs_tensor, track_tokens_seen, train_losses, val_losses)
+    # Loss plot is saved next to the checkpoint inside train_model_simple
 
 
 if __name__ == "__main__":

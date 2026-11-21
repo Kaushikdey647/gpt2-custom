@@ -5,9 +5,9 @@ import sys
 
 import tiktoken
 import torch
-from models import GPTModel
 from text_dataset import CHAT_TEMPLATE
 from utils import (
+    build_model,
     checkpoint_path,
     generate_text_simple,
     get_device,
@@ -45,7 +45,7 @@ def load_model(model_name, device):
     config = checkpoint.get("config")
     if config is None:
         raise ValueError(f"Checkpoint {path} has no config — retrain with current code.")
-    model = GPTModel(config)
+    model = build_model(config)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.to(device)
     model.eval()

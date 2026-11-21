@@ -5,8 +5,12 @@ import torch
 from huggingface_hub import hf_hub_download
 from matplotlib.ticker import MaxNLocator
 
-from models import GPTModel
+from models import GPT2MoEModel, GPTModel
 from text_dataset import IGNORE_INDEX
+
+
+def build_model(cfg):
+    return (GPT2MoEModel if cfg.get("use_moe") else GPTModel)(cfg)
 
 
 def get_device():
@@ -15,6 +19,53 @@ def get_device():
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
+
+
+def _device_memory(device):
+    gib = 1024**3
+    if device.type == "cuda":
+        props = torch.cuda.get_device_properties(device)
+        return f"{props.name}, {props.total_memory / gib:.1f} GiB"
+    try:
+        ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / gib
+    except (ValueError, OSError, AttributeError):
+        return device.type
+    if device.type == "mps":
+        return f"Apple MPS (unified memory), {ram:.1f} GiB system RAM"
+    return f"CPU, {ram:.1f} GiB system RAM"
+
+
+def print_training_summary(model, cfg, device, train_loader, val_loader, model_name):
+    """Print model, device, and hyperparameter details before training."""
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    size_mb = sum(p.numel() * p.element_size() for p in model.parameters()) / 1024**2
+    print("=" * 60)
+    print(f"Model:            {model_name} ({type(model).__name__})")
+    print(f"Parameters:       {total / 1e6:.2f}M total, {trainable / 1e6:.2f}M trainable (~{size_mb:.0f} MiB fp32)")
+    print(f"Train Tokens:     {train_loader.dataset.tokens_seen}")
+    print(f"Val Tokens:       {val_loader.dataset.tokens_seen}")
+    if cfg.get("use_moe"):
+        expert = sum(p.numel() for n, p in model.named_parameters() if ".experts." in n)
+        active = total - expert * (1 - cfg["top_k"] / cfg["num_experts"])
+        print(
+            f"MoE:              {cfg['num_experts']} experts, top-{cfg['top_k']}, "
+            f"expert_hidden_dim={cfg['expert_hidden_dim']}, ~{active / 1e6:.2f}M active params/token"
+        )
+        print(
+            f"MoE losses:       gate_noise_std={cfg['gate_noise_std']}, "
+            f"aux_loss_coef={cfg['aux_loss_coef']}, z_loss_coef={cfg['z_loss_coef']}"
+        )
+    print(
+        f"Architecture:     layers={cfg['num_layers']}, heads={cfg['num_heads']}, emb_dim={cfg['embedding_dim']}, "
+        f"ctx={cfg['context_length']}, vocab={cfg['vocab_size']}, dropout={cfg['dropout_rate']}, qkv_bias={cfg['qkv_bias']}"
+    )
+    print(
+        f"Training:         epochs={cfg['num_epochs']}, lr={cfg['learning_rate']}, batch_size={cfg['batch_size']}, "
+        f"train_batches={len(train_loader)}, val_batches={len(val_loader)}"
+    )
+    print(f"Device:           {device} ({_device_memory(device)})")
+    print("=" * 60)
 
 
 def generate_text_simple(model, idx, max_new_tokens, context_size, temperature=1.0):
@@ -42,14 +93,21 @@ def calc_loss_batch(input_batch, target_batch, model, device):
     input_batch = input_batch.to(device)
     target_batch = target_batch.to(device)
     logits = model(input_batch)
-    return torch.nn.functional.cross_entropy(
+    loss = torch.nn.functional.cross_entropy(
         logits.flatten(0, 1),
         target_batch.flatten(),
         ignore_index=IGNORE_INDEX,
     )
+    if hasattr(model, "aux_loss_coef") and model.training:
+        loss = loss + model.aux_loss_coef * model.aux_loss + model.z_loss_coef * model.z_loss
+    return loss
 
 
-def plot_losses(epochs_seen, tokens_seen, train_losses, val_losses):
+def loss_plot_path(model_name):
+    return os.path.join("model-data", f"{model_name}-losses.png")
+
+
+def plot_losses(epochs_seen, tokens_seen, train_losses, val_losses, save_path=None):
     fig, ax1 = plt.subplots(figsize=(5, 3))
     ax1.plot(epochs_seen, train_losses, label="Training loss")
     ax1.plot(epochs_seen, val_losses, linestyle="-.", label="Validation loss")
@@ -61,7 +119,10 @@ def plot_losses(epochs_seen, tokens_seen, train_losses, val_losses):
     ax2.plot(tokens_seen, train_losses, alpha=0)
     ax2.set_xlabel("Tokens seen")
     fig.tight_layout()
-    plt.show()
+    if save_path:
+        fig.savefig(save_path, dpi=150)
+        print(f"Saved loss plot: {save_path}")
+    plt.close(fig)
 
 
 def calc_loss_loader(data_loader, model, device, num_batches=None):
@@ -327,5 +388,8 @@ def train_model_simple(
             track_tokens_seen,
             config,
         )
+        if train_losses:
+            epochs_seen = torch.linspace(0, epoch + 1, len(train_losses))
+            plot_losses(epochs_seen, track_tokens_seen, train_losses, val_losses, loss_plot_path(model_name))
 
     return train_losses, val_losses, track_tokens_seen
