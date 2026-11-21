@@ -33,13 +33,13 @@ def main():
         "num_layers": 12,
         "dropout_rate": 0.1,
         "qkv_bias": False,
-        "batch_size": 8,
+        "batch_size": 64,
         "learning_rate": 1e-4,
         "num_epochs": 2,
         "start_context": "In this chapter",
         "use_moe": True,
         "num_experts": 8,
-        "top_k": 2,
+        "top_k": 1,
         "expert_hidden_dim": 768,
         "gate_noise_std": 0.1,
         "aux_loss_coef": 0.01,
@@ -62,7 +62,10 @@ def main():
     device = get_device()
     model.to(device)
     print_training_summary(model, GPT_CONFIG_MOE, device, train_loader, val_loader, model_name)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=GPT_CONFIG_MOE["learning_rate"])
+    # fused=True runs the AdamW update as one kernel on cuda/mps
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=GPT_CONFIG_MOE["learning_rate"], fused=device.type in ("cuda", "mps")
+    )
 
     if os.path.exists(checkpoint_path(model_name)):
         print("Resuming from checkpoint — sample after load happens inside training.")
@@ -77,7 +80,7 @@ def main():
         optimizer=optimizer,
         device=device,
         num_epochs=GPT_CONFIG_MOE["num_epochs"],
-        eval_freq=100,
+        eval_freq=10000,
         eval_iter=10,
         start_context=GPT_CONFIG_MOE["start_context"],
         tokenizer=tokenizer,

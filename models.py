@@ -53,6 +53,12 @@ class GPT2MoEModel(nn.Module):
         # Router z-loss from the last forward pass, summed over layers
         return sum(block.moe.z_loss for block in self.moe_blocks)
 
+    def router_stats(self):
+        """Routing stats from the last forward pass: (num_layers, num_experts) load fractions, mean entropy."""
+        frac = torch.stack([block.moe.expert_frac for block in self.moe_blocks])
+        entropy = torch.stack([block.moe.router_entropy for block in self.moe_blocks]).mean()
+        return frac, entropy
+
     def forward(self, x):
         batch_size, seq_len = x.shape
         token_embeddings = self.token_embedding(x)

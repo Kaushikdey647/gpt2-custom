@@ -1,9 +1,14 @@
+import math
 import os
+import signal
+import sys
+import termios
 
 import matplotlib.pyplot as plt
 import torch
 from huggingface_hub import hf_hub_download
 from matplotlib.ticker import MaxNLocator
+from tqdm import tqdm
 
 from models import GPT2MoEModel, GPTModel
 from text_dataset import IGNORE_INDEX
@@ -43,8 +48,9 @@ def print_training_summary(model, cfg, device, train_loader, val_loader, model_n
     print("=" * 60)
     print(f"Model:            {model_name} ({type(model).__name__})")
     print(f"Parameters:       {total / 1e6:.2f}M total, {trainable / 1e6:.2f}M trainable (~{size_mb:.0f} MiB fp32)")
-    print(f"Train Tokens:     {train_loader.dataset.tokens_seen}")
-    print(f"Val Tokens:       {val_loader.dataset.tokens_seen}")
+    # Windows x context length: exact for LM datasets, an upper bound for padded chat datasets
+    print(f"Train Tokens:     ~{len(train_loader.dataset) * cfg['context_length']:,}")
+    print(f"Val Tokens:       ~{len(val_loader.dataset) * cfg['context_length']:,}")
     if cfg.get("use_moe"):
         expert = sum(p.numel() for n, p in model.named_parameters() if ".experts." in n)
         active = total - expert * (1 - cfg["top_k"] / cfg["num_experts"])
@@ -108,20 +114,30 @@ def loss_plot_path(model_name):
 
 
 def plot_losses(epochs_seen, tokens_seen, train_losses, val_losses, save_path=None):
-    fig, ax1 = plt.subplots(figsize=(5, 3))
-    ax1.plot(epochs_seen, train_losses, label="Training loss")
-    ax1.plot(epochs_seen, val_losses, linestyle="-.", label="Validation loss")
-    ax1.set_xlabel("Epochs")
-    ax1.set_ylabel("Loss")
-    ax1.legend(loc="upper right")
-    ax1.xaxis.set_major_locator(MaxNLocator(integer=True))
-    ax2 = ax1.twiny()
-    ax2.plot(tokens_seen, train_losses, alpha=0)
-    ax2.set_xlabel("Tokens seen")
+    """Three panels: train/val loss, train/val perplexity, val - train gap."""
+    train = torch.tensor(train_losses)
+    val = torch.tensor(val_losses)
+    panels = [
+        ("Loss", [(train, "Train", "-"), (val, "Val", "-.")]),
+        ("Perplexity", [(train.exp(), "Train", "-"), (val.exp(), "Val", "-.")]),
+        ("Val - train gap", [(val - train, "Gap", "-")]),
+    ]
+    fig, axes = plt.subplots(1, 3, figsize=(15, 3.5))
+    for ax, (ylabel, series) in zip(axes, panels):
+        for values, label, style in series:
+            ax.plot(epochs_seen, values, linestyle=style, label=label)
+        ax.set_xlabel("Epochs")
+        ax.set_ylabel(ylabel)
+        ax.legend(loc="upper right")
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+        top = ax.twiny()
+        top.plot(tokens_seen, series[0][0], alpha=0)
+        top.set_xlabel("Tokens seen")
+    axes[1].set_yscale("log")
     fig.tight_layout()
     if save_path:
         fig.savefig(save_path, dpi=150)
-        print(f"Saved loss plot: {save_path}")
+        tqdm.write(f"  plot      {save_path}")
     plt.close(fig)
 
 
@@ -159,8 +175,7 @@ def generate_and_print_sample(model: GPTModel, tokenizer, device, start_context)
         token_ids = generate_text_simple(model, encoded, max_new_tokens=50, context_size=context_size)
     generated = token_ids_to_text(token_ids[:, encoded.shape[1] :], tokenizer)
     generated = generated.split("<|endoftext|>", 1)[0].strip()
-    print(f"Prompt: {start_context.strip()}")
-    print(f"Generated: {generated or '(empty)'}")
+    tqdm.write(f"  prompt    {start_context.strip()}\n  sample    {generated or '(empty)'}")
     model.train()
 
 
@@ -199,7 +214,7 @@ def save_checkpoint(
         },
         path,
     )
-    print(f"Saved checkpoint: {path}")
+    tqdm.write(f"  saved     {path}")
 
 
 def load_checkpoint(path, model, optimizer, device, config=None):
@@ -302,6 +317,50 @@ def load_openai_gpt2_weights(model, device, repo_id="openai-community/gpt2"):
     print(f"Loaded OpenAI GPT-2 weights from {repo_id} (context {ctx})")
 
 
+def _format_loss_metrics(step, train_loss, val_loss, grad_norm):
+    return (
+        f"eval @ step {step:,}  train {train_loss:.3f} · val {val_loss:.3f} · "
+        f"ppl {math.exp(train_loss):.1f}/{math.exp(val_loss):.1f} · "
+        f"gap {val_loss - train_loss:+.3f} · gnorm {grad_norm:.2f}"
+    )
+
+
+def _format_moe_metrics(model):
+    """Load-balancing loss, router entropy (vs. max ln E) and per-expert load averaged over layers."""
+    frac, entropy = model.router_stats()
+    load = frac.mean(0).mul(100).round().int().tolist()
+    return (
+        f"lb {model.aux_loss.item():.3f} · H {entropy.item():.2f}/{math.log(frac.shape[1]):.2f} · "
+        f"load% {'/'.join(map(str, load))} (max {frac.max().item() * 100:.0f})"
+    )
+
+
+class _PauseOnInterrupt:
+    """First Ctrl+C requests a pause (eval + sample, then resume); a second one before it's handled aborts."""
+
+    def __enter__(self):
+        self.requested = False
+        self._previous = signal.signal(signal.SIGINT, self._handle)
+        # Stop the terminal echoing a literal "^C" into the progress bar
+        self._tty = None
+        if sys.stdin.isatty():
+            self._tty = termios.tcgetattr(sys.stdin)
+            attrs = termios.tcgetattr(sys.stdin)
+            attrs[3] &= ~termios.ECHOCTL
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, attrs)
+        return self
+
+    def _handle(self, signum, frame):
+        if self.requested:
+            raise KeyboardInterrupt
+        self.requested = True
+
+    def __exit__(self, *exc):
+        signal.signal(signal.SIGINT, self._previous)
+        if self._tty is not None:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self._tty)
+
+
 def train_model_simple(
     model,
     train_loader,
@@ -344,52 +403,87 @@ def train_model_simple(
             return train_losses, val_losses, track_tokens_seen
         print(f"Resuming from epoch {start_epoch + 1}/{num_epochs}")
 
-    for epoch in range(start_epoch, num_epochs):
-        print(f"Epoch {epoch + 1}/{num_epochs}")
-        print("-" * 10)
-        print("Training...")
-        model.train()
-        for input_batch, target_batch in train_loader:
-            optimizer.zero_grad()
-            loss = calc_loss_batch(input_batch, target_batch, model, device)
-            loss.backward()
-            if grad_clip is not None:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            optimizer.step()
-            tokens_seen += input_batch.numel()
-            global_step += 1
+    print("Ctrl+C: eval + sample, then continue · Ctrl+C twice: abort\n")
+    steps_per_epoch = len(train_loader)
+    bar = tqdm(
+        total=num_epochs * steps_per_epoch,
+        initial=start_epoch * steps_per_epoch,
+        unit="step",
+        dynamic_ncols=True,
+        bar_format="{desc} {percentage:3.0f}%|{bar:20}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {postfix}",
+    )
+    session_tokens = 0
+    # .item() only when the display refreshes to avoid per-step host syncs
+    grad_norm = torch.tensor(float("nan"))
 
-            if global_step % eval_freq == 0:
-                train_loss, val_loss = evaluate_model(
-                    model, train_loader, val_loader, device, eval_iter
-                )
-                train_losses.append(train_loss)
-                val_losses.append(val_loss)
-                track_tokens_seen.append(tokens_seen)
-                print(
-                    f"Epoch {epoch + 1}/{num_epochs}, Step {global_step}, "
-                    f"Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}"
-                )
-                print(f"Tokens Seen: {tokens_seen}")
-                print("-" * 50)
+    with _PauseOnInterrupt() as pause:
+        try:
+            for epoch in range(start_epoch, num_epochs):
+                model.train()
+                for input_batch, target_batch in train_loader:
+                    optimizer.zero_grad()
+                    loss = calc_loss_batch(input_batch, target_batch, model, device)
+                    loss.backward()
+                    # Returns the pre-clip norm; max_norm=inf just measures it
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), grad_clip if grad_clip is not None else float("inf")
+                    )
+                    optimizer.step()
+                    tokens_seen += input_batch.numel()
+                    session_tokens += input_batch.numel()
+                    global_step += 1
+                    bar.update(1)
 
-        generate_and_print_sample(model, tokenizer, device, start_context)
-        save_checkpoint(
-            path,
-            model,
-            optimizer,
-            epoch,
-            global_step,
-            tokens_seen,
-            train_loss,
-            val_loss,
-            train_losses,
-            val_losses,
-            track_tokens_seen,
-            config,
-        )
-        if train_losses:
-            epochs_seen = torch.linspace(0, epoch + 1, len(train_losses))
-            plot_losses(epochs_seen, track_tokens_seen, train_losses, val_losses, loss_plot_path(model_name))
+                    if global_step % 10 == 0:
+                        elapsed = bar.format_dict["elapsed"] or 1e-9
+                        bar.set_description(f"Epoch {epoch + 1}/{num_epochs}")
+                        bar.set_postfix_str(
+                            f"loss {loss.item():.3f} · {session_tokens / elapsed:,.0f} tok/s"
+                        )
+
+                    if global_step % eval_freq == 0 or pause.requested:
+                        # Read MoE routing stats from this training step before eval forwards overwrite them
+                        moe_line = _format_moe_metrics(model) if hasattr(model, "router_stats") else None
+                        train_loss, val_loss = evaluate_model(model, train_loader, val_loader, device, eval_iter)
+                        line = _format_loss_metrics(global_step, train_loss, val_loss, grad_norm.item())
+                        if moe_line:
+                            line += "\n    moe  " + moe_line
+                        if not pause.requested:
+                            tqdm.write(line)
+                        if global_step % eval_freq == 0:
+                            train_losses.append(train_loss)
+                            val_losses.append(val_loss)
+                            track_tokens_seen.append(tokens_seen)
+
+                    if pause.requested:
+                        tqdm.write(f"\n⏸  paused\n{line}")
+                        generate_and_print_sample(model, tokenizer, device, start_context)
+                        tqdm.write("▶  resuming\n")
+                        pause.requested = False
+
+                tqdm.write(f"\n── end of epoch {epoch + 1}/{num_epochs} ──")
+                generate_and_print_sample(model, tokenizer, device, start_context)
+                save_checkpoint(
+                    path,
+                    model,
+                    optimizer,
+                    epoch,
+                    global_step,
+                    tokens_seen,
+                    train_loss,
+                    val_loss,
+                    train_losses,
+                    val_losses,
+                    track_tokens_seen,
+                    config,
+                )
+                if train_losses:
+                    epochs_seen = torch.linspace(0, epoch + 1, len(train_losses))
+                    plot_losses(epochs_seen, track_tokens_seen, train_losses, val_losses, loss_plot_path(model_name))
+        except KeyboardInterrupt:
+            # Checkpoints are per-epoch, so progress since the last epoch end is discarded
+            tqdm.write(f"Aborted at step {global_step}; last checkpoint: {path}")
+        finally:
+            bar.close()
 
     return train_losses, val_losses, track_tokens_seen

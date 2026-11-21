@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "skills": {
+    "ai-research-moe-training": {
+      "version": "1.0.0",
+      "installedAt": "2026-11-20T20:34:19.592Z",
+      "platform": "gemini"
+    }
+  }
+}

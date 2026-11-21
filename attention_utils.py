@@ -114,6 +114,8 @@ class MoeLayer(nn.Module):
         self.experts = nn.ModuleList([Expert(cfg) for _ in range(self.num_experts)])
         self.register_buffer("aux_loss", torch.tensor(0.0), persistent=False)  # follows .to(device)
         self.register_buffer("z_loss", torch.tensor(0.0), persistent=False)
+        self.register_buffer("expert_frac", torch.zeros(self.num_experts), persistent=False)
+        self.register_buffer("router_entropy", torch.tensor(0.0), persistent=False)
 
     def forward(self, x):
         batch_size, seq_len, dim = x.shape
@@ -145,6 +147,9 @@ class MoeLayer(nn.Module):
         self.aux_loss = self.num_experts * (frac * probs.mean(0)).sum()
         # Router z-loss (ST-MoE): penalises large router logits for stability
         self.z_loss = torch.logsumexp(clean_logits, dim=-1).pow(2).mean()
+        # Detached routing stats for logging only
+        self.expert_frac = frac.detach()
+        self.router_entropy = -(probs * probs.clamp_min(1e-9).log()).sum(-1).mean().detach()
 
         return out.view(batch_size, seq_len, dim)
 

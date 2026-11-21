@@ -6,6 +6,7 @@ import tiktoken
 import torch
 
 from text_dataset import create_dataloader_cosmopedia, create_dataloader_cosmopedia_full, create_dataloader_gsm8k
+from train_gpt2_moe_cosmopedia import SUBSETS
 from utils import (
     build_model,
     calc_loss_loader,
@@ -34,11 +35,11 @@ def main():
     if args.dataset == "gsm8k":
         _, val_loader = create_dataloader_gsm8k(config)
     elif args.full:
-        _, val_loader = create_dataloader_cosmopedia_full(config)
+        _, val_loader = create_dataloader_cosmopedia_full(config, subset=SUBSETS)
     else:
-        # Same subset/seed as training, so val split is held-out
+        # Same subsets/samples/seed as train_gpt2_moe_cosmopedia.py, so val split is held-out
         _, val_loader = create_dataloader_cosmopedia(
-            config, subset="stanford", max_samples=5000, val_ratio=0.1, seed=123
+            config, subset=SUBSETS, max_samples=10000, val_ratio=0.1, seed=123
         )
 
     with torch.no_grad():
