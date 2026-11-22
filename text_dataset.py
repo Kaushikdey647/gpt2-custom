@@ -288,15 +288,21 @@ def create_dataloader_lm(text, config: dict, shuffle=True, drop_last=True):
     )
 
 
-def _load_cosmopedia(subsets, max_samples=None, seed=123):
-    """Load one or more Cosmopedia subsets and concatenate; max_samples applies per subset."""
+def _load_cosmopedia(subsets, max_samples=None, seed=123, with_subset=False):
+    """Load one or more Cosmopedia subsets and concatenate; max_samples applies per subset.
+
+    with_subset adds a "subset" column; it doesn't change row order, so shuffles/splits are identical.
+    """
     subsets = [subsets] if isinstance(subsets, str) else list(subsets)
     parts = []
     for name in subsets:
         ds = load_dataset("HuggingFaceTB/cosmopedia", name, split="train")
         if max_samples is not None:
             ds = ds.shuffle(seed=seed).select(range(min(max_samples, len(ds))))
-        parts.append(ds.select_columns(["text"]))
+        ds = ds.select_columns(["text"])
+        if with_subset:
+            ds = ds.add_column("subset", [name] * len(ds))
+        parts.append(ds)
     return concatenate_datasets(parts)
 
 

@@ -12,4 +12,6 @@ dependencies = [
     "tiktoken>=0.14.0",
     "torch>=2.15.0",
     "tqdm>=4.70.1",
+    "wandb>=0.31.0",
+    "weave>=0.54.1",
 ]

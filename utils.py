@@ -2,12 +2,14 @@ import math
 import os
 import signal
 import sys
+import time
 import termios
 
 import matplotlib.pyplot as plt
 import torch
 from huggingface_hub import hf_hub_download
 from matplotlib.ticker import MaxNLocator
+import wandb
 from tqdm import tqdm
 
 from models import GPT2MoEModel, GPTModel
@@ -24,6 +26,36 @@ def get_device():
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
+
+
+def init_wandb(project, model_name, config, no_wandb=False, tags=(), extra_config=None):
+    """One project per train script; id=model_name so resuming a checkpoint resumes its W&B run.
+
+    Rename the model for a new version (also starts a fresh checkpoint). Mode None honours WANDB_MODE.
+    """
+    return wandb.init(
+        project=project,
+        id=model_name,
+        name=model_name,
+        resume="allow",
+        mode="disabled" if no_wandb else None,
+        job_type="train",
+        config={"model_name": model_name, **config, **(extra_config or {})},
+        tags=list(tags),
+    )
+
+
+def eval_every(steps_per_epoch, num_epochs, points=200):
+    """Eval interval giving ~`points` curve points over the whole run."""
+    return max(1, steps_per_epoch * num_epochs // points)
+
+
+def _device_mem_gib(device):
+    if device.type == "cuda":
+        return torch.cuda.memory_allocated(device) / 1024**3
+    if device.type == "mps":
+        return torch.mps.current_allocated_memory() / 1024**3
+    return None
 
 
 def _device_memory(device):
@@ -177,6 +209,7 @@ def generate_and_print_sample(model: GPTModel, tokenizer, device, start_context)
     generated = generated.split("<|endoftext|>", 1)[0].strip()
     tqdm.write(f"  prompt    {start_context.strip()}\n  sample    {generated or '(empty)'}")
     model.train()
+    return generated
 
 
 def checkpoint_path(model_name):
@@ -325,13 +358,23 @@ def _format_loss_metrics(step, train_loss, val_loss, grad_norm):
     )
 
 
-def _format_moe_metrics(model):
+def _moe_stats(model):
     """Load-balancing loss, router entropy (vs. max ln E) and per-expert load averaged over layers."""
     frac, entropy = model.router_stats()
-    load = frac.mean(0).mul(100).round().int().tolist()
+    return {
+        "aux_loss": model.aux_loss.item(),
+        "entropy": entropy.item(),
+        "max_entropy": math.log(frac.shape[1]),
+        "load_pct": frac.mean(0).mul(100).tolist(),
+        "max_load_pct": frac.max().item() * 100,
+    }
+
+
+def _format_moe_metrics(m):
+    load = "/".join(str(round(x)) for x in m["load_pct"])
     return (
-        f"lb {model.aux_loss.item():.3f} · H {entropy.item():.2f}/{math.log(frac.shape[1]):.2f} · "
-        f"load% {'/'.join(map(str, load))} (max {frac.max().item() * 100:.0f})"
+        f"lb {m['aux_loss']:.3f} · H {m['entropy']:.2f}/{m['max_entropy']:.2f} · "
+        f"load% {load} (max {m['max_load_pct']:.0f})"
     )
 
 
@@ -375,7 +418,9 @@ def train_model_simple(
     model_name,
     config=None,
     grad_clip=1.0,
+    run=None,
 ):
+    """run: optional wandb run; logged against a "step" axis so resumed epochs don't violate wandb's step ordering."""
     model.to(device)
     path = checkpoint_path(model_name)
 
@@ -403,6 +448,11 @@ def train_model_simple(
             return train_losses, val_losses, track_tokens_seen
         print(f"Resuming from epoch {start_epoch + 1}/{num_epochs}")
 
+    if run is not None:
+        run.define_metric("step")
+        run.define_metric("tokens_seen", step_metric="step")
+        for prefix in ("train/*", "eval/*", "moe/*", "system/*", "samples", "plots/*"):
+            run.define_metric(prefix, step_metric="step")
     print("Ctrl+C: eval + sample, then continue · Ctrl+C twice: abort\n")
     steps_per_epoch = len(train_loader)
     bar = tqdm(
@@ -413,6 +463,8 @@ def train_model_simple(
         bar_format="{desc} {percentage:3.0f}%|{bar:20}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {postfix}",
     )
     session_tokens = 0
+    start_time = time.time()
+    sample_rows = []
     # .item() only when the display refreshes to avoid per-step host syncs
     grad_norm = torch.tensor(float("nan"))
 
@@ -437,17 +489,61 @@ def train_model_simple(
                     if global_step % 10 == 0:
                         elapsed = bar.format_dict["elapsed"] or 1e-9
                         bar.set_description(f"Epoch {epoch + 1}/{num_epochs}")
-                        bar.set_postfix_str(
-                            f"loss {loss.item():.3f} · {session_tokens / elapsed:,.0f} tok/s"
-                        )
+                        loss_val = loss.item()
+                        tok_s = session_tokens / elapsed
+                        bar.set_postfix_str(f"loss {loss_val:.3f} · {tok_s:,.0f} tok/s")
+                        if run is not None:
+                            metrics = {
+                                "step": global_step,
+                                "tokens_seen": tokens_seen,
+                                "train/loss": loss_val,  # total optimised loss (incl. MoE aux terms)
+                                "train/grad_norm": grad_norm.item(),
+                                "train/grad_clipped": float(grad_clip is not None and grad_norm.item() > grad_clip),
+                                "train/param_norm": torch.linalg.vector_norm(
+                                    torch.stack([torch.linalg.vector_norm(p.detach()) for p in model.parameters()])
+                                ).item(),
+                                "train/lr": optimizer.param_groups[0]["lr"],
+                                "train/tokens_per_sec": tok_s,
+                                "train/epoch": epoch + (global_step % steps_per_epoch + 1) / steps_per_epoch,
+                                "train/elapsed_min": (time.time() - start_time) / 60,
+                            }
+                            if hasattr(model, "aux_loss_coef"):
+                                aux, z = model.aux_loss.item(), model.z_loss.item()
+                                metrics["train/ce_loss"] = loss_val - model.aux_loss_coef * aux - model.z_loss_coef * z
+                                metrics["moe/aux_loss_step"] = aux
+                                metrics["moe/z_loss_step"] = z
+                            mem = _device_mem_gib(device)
+                            if mem is not None:
+                                metrics["system/device_mem_gib"] = mem
+                            run.log(metrics)
 
                     if global_step % eval_freq == 0 or pause.requested:
                         # Read MoE routing stats from this training step before eval forwards overwrite them
-                        moe_line = _format_moe_metrics(model) if hasattr(model, "router_stats") else None
+                        moe = _moe_stats(model) if hasattr(model, "router_stats") else None
                         train_loss, val_loss = evaluate_model(model, train_loader, val_loader, device, eval_iter)
                         line = _format_loss_metrics(global_step, train_loss, val_loss, grad_norm.item())
-                        if moe_line:
-                            line += "\n    moe  " + moe_line
+                        if moe:
+                            line += "\n    moe  " + _format_moe_metrics(moe)
+                        if run is not None:
+                            metrics = {
+                                "step": global_step,
+                                "tokens_seen": tokens_seen,
+                                "eval/train_loss": train_loss,
+                                "eval/val_loss": val_loss,
+                                "eval/train_ppl": math.exp(train_loss),
+                                "eval/val_ppl": math.exp(val_loss),
+                                "eval/gap": val_loss - train_loss,
+                            }
+                            if moe:
+                                metrics.update(
+                                    {
+                                        "moe/aux_loss": moe["aux_loss"],
+                                        "moe/router_entropy": moe["entropy"],
+                                        "moe/max_expert_load_pct": moe["max_load_pct"],
+                                        **{f"moe/expert_load_pct/{i}": v for i, v in enumerate(moe["load_pct"])},
+                                    }
+                                )
+                            run.log(metrics)
                         if not pause.requested:
                             tqdm.write(line)
                         if global_step % eval_freq == 0:
@@ -462,7 +558,8 @@ def train_model_simple(
                         pause.requested = False
 
                 tqdm.write(f"\n── end of epoch {epoch + 1}/{num_epochs} ──")
-                generate_and_print_sample(model, tokenizer, device, start_context)
+                sample = generate_and_print_sample(model, tokenizer, device, start_context)
+                sample_rows.append([epoch + 1, global_step, start_context, sample])
                 save_checkpoint(
                     path,
                     model,
@@ -480,10 +577,23 @@ def train_model_simple(
                 if train_losses:
                     epochs_seen = torch.linspace(0, epoch + 1, len(train_losses))
                     plot_losses(epochs_seen, track_tokens_seen, train_losses, val_losses, loss_plot_path(model_name))
+                if run is not None:
+                    media = {
+                        "step": global_step,
+                        "samples": wandb.Table(columns=["epoch", "step", "prompt", "generated"], data=sample_rows),
+                    }
+                    if train_losses:
+                        media["plots/losses"] = wandb.Image(loss_plot_path(model_name))
+                    run.log(media)
         except KeyboardInterrupt:
             # Checkpoints are per-epoch, so progress since the last epoch end is discarded
             tqdm.write(f"Aborted at step {global_step}; last checkpoint: {path}")
         finally:
             bar.close()
+            if run is not None:
+                run.summary["train/total_minutes"] = (time.time() - start_time) / 60
+                run.summary["train/final_tokens_seen"] = tokens_seen
+                run.summary["train/final_eval_train_loss"] = train_loss
+                run.summary["train/final_eval_val_loss"] = val_loss
 
     return train_losses, val_losses, track_tokens_seen
