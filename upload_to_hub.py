@@ -5,7 +5,7 @@ import shutil
 import tempfile
 
 import torch
-from huggingface_hub import HfApi
+from huggingface_hub import EvalResult, HfApi, ModelCardData
 
 from eval_common import eval_results_path
 from utils import checkpoint_path, loss_plot_path
@@ -19,19 +19,48 @@ def model_card(model_name, checkpoint):
     results = ev["results"] if ev else None
     train_subsets = ", ".join(ev["train_subsets"]) if ev else "Cosmopedia"
 
-    meta = ["---", "library_name: pytorch", "pipeline_tag: text-generation", "language: en",
-            "datasets:", "- HuggingFaceTB/cosmopedia", "tags:", "- gpt2", "- text-generation"]
-    if kind == "MoE":
-        meta.append("- mixture-of-experts")
+    eval_results = []
     if results:
-        o = results["overall_in_dist"]
-        meta += ["model-index:", f"- name: {model_name}", "  results:", "  - task:", "      type: text-generation",
-                 "    dataset:", "      name: Cosmopedia (held-out docs of training subsets)", "      type: HuggingFaceTB/cosmopedia",
-                 "    metrics:", "    - type: loss", f"      value: {o['loss']:.4f}", "    - type: perplexity",
-                 f"      value: {o['ppl']:.2f}"]
-    meta.append("---")
+        for name, r in results.items():
+            if name == "overall_all":
+                continue  # mixes held-out and unseen subsets; the table in the body shows it
+            overall = name == "overall_in_dist"
+            for metric_type, metric_name, value in (
+                ("perplexity", "Perplexity", r["ppl"]),
+                ("loss", "Cross-entropy loss (nats/token)", r["loss"]),
+            ):
+                eval_results.append(
+                    EvalResult(
+                        task_type="text-generation",
+                        task_name="Text Generation",
+                        dataset_type="HuggingFaceTB/cosmopedia",
+                        dataset_name="Cosmopedia (held-out, all trained subsets)" if overall else f"Cosmopedia ({name})",
+                        dataset_config=None if overall else name,
+                        dataset_split="train",  # Cosmopedia only ships `train`; eval docs are carved out of it
+                        dataset_args={
+                            "eval_split": "held-out" if overall else r["split"],
+                            "docs_per_subset": ev["rows_per_subset"],
+                            "context_length": ev["context_length"],
+                            "tokens": r["tokens"],
+                        },
+                        metric_type=metric_type,
+                        metric_name=metric_name,
+                        metric_value=round(value, 4),
+                    )
+                )
+    tags = ["gpt2", "text-generation"] + (["mixture-of-experts"] if kind == "MoE" else [])
+    meta = "---\n" + ModelCardData(
+        model_name=model_name,
+        library_name="pytorch",
+        pipeline_tag="text-generation",
+        language="en",
+        datasets=["HuggingFaceTB/cosmopedia"],
+        metrics=["perplexity", "loss"] if eval_results else None,
+        tags=tags,
+        eval_results=eval_results or None,
+    ).to_yaml() + "\n---"
 
-    lines = ["\n".join(meta), "", f"# {model_name}", "",
+    lines = [meta, "", f"# {model_name}", "",
              f"Custom GPT-2 style {kind} model, trained from scratch on Cosmopedia ({train_subsets}).", "",
              "## Model", "", "| | |", "|---|---|"]
     lines += [f"| {k} | {config[k]} |" for k in ("num_layers", "num_heads", "embedding_dim", "context_length", "vocab_size")

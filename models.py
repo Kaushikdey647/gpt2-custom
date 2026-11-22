@@ -69,3 +69,20 @@ class GPT2MoEModel(nn.Module):
         x = self.final_norm(x)
         logits = self.out_head(x)
         return logits # [batch_size, seq_len, vocab_size]
+
+class GPT2LoraWrapper(GPTModel):
+    def __init__(self, cfg):
+        super().__init__(cfg)
+        self.lora_r = cfg["lora_r"]
+        self.lora_alpha = cfg["lora_alpha"]
+        self.lora_scaling = self.lora_alpha / self.lora_r
+        self.lora_A = nn.Parameter(torch.randn(cfg["embedding_dim"], self.lora_r))
+        self.lora_B = nn.Parameter(torch.randn(self.lora_r, cfg["embedding_dim"]))
+        self.lora_dropout = nn.Dropout(cfg["lora_dropout"])
+
+    def forward(self, x):
+        original_logits = super().forward(x)
+        batch_size, seq_len, vocab_size = original_logits.shape
+        x = x.view(batch_size * seq_len, -1)
+        lora_logits = self.lora_weight(x)
+        return original_logits + lora_logits
