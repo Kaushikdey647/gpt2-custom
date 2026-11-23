@@ -4,8 +4,8 @@ import os
 import tiktoken
 import torch
 
-from text_dataset import create_dataloader_cosmopedia, create_dataloader_cosmopedia_full
-from utils import (
+from src.text_dataset import create_dataloader_cosmopedia, create_dataloader_cosmopedia_full
+from src.utils import (
     build_model,
     checkpoint_path,
     eval_every,

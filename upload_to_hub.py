@@ -7,8 +7,8 @@ import tempfile
 import torch
 from huggingface_hub import EvalResult, HfApi, ModelCardData
 
-from eval_common import eval_results_path
-from utils import checkpoint_path, loss_plot_path
+from src.eval_common import eval_results_path
+from src.utils import checkpoint_path, loss_plot_path
 
 
 def model_card(model_name, checkpoint):

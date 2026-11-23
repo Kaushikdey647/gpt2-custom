@@ -3,9 +3,9 @@ import os
 import tiktoken
 import torch
 
-from models import GPTModel
-from text_dataset import CHAT_TEMPLATE, create_dataloader_gsm8k
-from utils import (
+from src.models import GPTModel
+from src.text_dataset import CHAT_TEMPLATE, create_dataloader_gsm8k
+from src.utils import (
     checkpoint_path,
     generate_and_print_sample,
     get_device,

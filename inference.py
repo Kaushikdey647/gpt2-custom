@@ -5,8 +5,8 @@ import sys
 
 import tiktoken
 import torch
-from text_dataset import CHAT_TEMPLATE
-from utils import (
+from src.text_dataset import CHAT_TEMPLATE
+from src.utils import (
     build_model,
     checkpoint_path,
     generate_text_simple,

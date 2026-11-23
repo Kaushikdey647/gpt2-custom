@@ -9,13 +9,13 @@ import tiktoken
 import torch
 import wandb
 
-from text_dataset import (
+from .text_dataset import (
     _load_cosmopedia,
     create_dataloader_cosmopedia_full,
     create_dataloader_gsm8k,
     create_dataloader_lm,
 )
-from utils import (
+from .utils import (
     build_model,
     calc_loss_batch,
     calc_loss_loader,

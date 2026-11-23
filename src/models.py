@@ -1,4 +1,4 @@
-from attention_utils import LayerNorm, TransformerBlock, MOEBlock
+from .attention_utils import LayerNorm, TransformerBlock, MOEBlock
 import torch
 import torch.nn as nn
 

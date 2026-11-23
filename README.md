@@ -1,25 +1,36 @@
 # GPT2 Custom
 
-A from-scratch GPT-2–style decoder-only transformer in PyTorch, following the *Build a Large Language Model (From Scratch)* path: pretrain on next-token prediction, then instruction fine-tune, then generate.
+A from-scratch GPT-2–style decoder-only transformer in PyTorch, following the *Build a Large Language Model (From Scratch)* path: pretrain on next-token prediction (dense and 8-expert MoE variants), instruction fine-tune (full, LoRA or QLoRA), evaluate, generate, and publish to the Hugging Face Hub. Every training run is tracked in Weights & Biases.
 
-Tokenizer is **tiktoken GPT-2** (`vocab_size=50257`). Checkpoints land in `model-data/`.
+Tokenizer is **tiktoken GPT-2** (`vocab_size=50257`). Checkpoints land in `model-data/` (gitignored).
 
 ## Setup
 
 ```bash
 uv sync
-# or: pip install -e .
+wandb login            # once; or pass --no-wandb to any train/eval script
 ```
 
-Requires Python ≥ 3.13. Training picks CUDA → MPS → CPU automatically.
+Requires Python ≥ 3.13. Training picks CUDA → MPS → CPU automatically. Hub upload needs `huggingface-cli login` (or `HF_TOKEN`).
 
-| Script | Role |
-|--------|------|
-| `train_gpt2_cosmopedia.py` | Pretrain from scratch on Cosmopedia |
-| `train_gpt2_moe_cosmopedia.py` | Pretrain the 8-expert MoE variant from scratch on Cosmopedia |
-| `train_gpt2_gsm8k.py` | Fine-tune your Cosmopedia checkpoint on GSM8K |
-| `train_openai_gpt2_gsm8k.py` | Load OpenAI GPT-2 weights, then fine-tune on GSM8K |
-| `inference.py` | Interactive generation / chat from a saved checkpoint |
+All scripts run from the repo root as `uv run python <script>.py [flags]`. `--no-wandb` works on every train/eval script; `--help` lists all flags.
+
+| Script | Role | Flags |
+|--------|------|-------|
+| `train_gpt2_cosmopedia.py` | Pretrain the dense model from scratch on Cosmopedia (`stanford`) | `--full`, `--no-wandb` |
+| `train_gpt2_moe_cosmopedia.py` | Pretrain the 8-expert MoE model on six mixed Cosmopedia subsets | `--full`, `--no-wandb` |
+| `train_gpt2_gsm8k.py` | Full fine-tune your dense checkpoint on GSM8K | |
+| `train_openai_gpt2_gsm8k.py` | Load OpenAI GPT-2 weights, then fully fine-tune on GSM8K | |
+| `train_gpt2_lora_gsm8k.py` | LoRA (or QLoRA) fine-tune of the dense checkpoint on GSM8K | `--qlora`, `--no-wandb` |
+| `eval_gpt2_cosmopedia.py` / `eval_gpt2_moe_cosmopedia.py` | Per-subset + overall eval of the matching train script's model | `--model`, `--dataset {cosmopedia,gsm8k}`, `--full`, `--rows-per-subset`, `--num-batches`, `--prompt`, `--no-wandb` |
+| `eval_gpt2_lora_gsm8k.py` | GSM8K loss for base vs base+adapter vs merged | `--qlora`, `--model`, `--no-wandb` |
+| `inference.py` | Interactive generation / chat from a saved checkpoint | `--list`, `--model`, `--mode {auto,chat,complete}`, `--max-new-tokens` |
+| `compare_generators.py` | Continue a held-out Cosmopedia doc with greedy, top-k and nucleus decoding | `--model` (required), `--subsets`, `--index`, `--prefix-tokens`, `--max-new-tokens`, `--temperature`, `--seed` |
+| `upload_to_hub.py` | Push a checkpoint + generated model card (with eval results) to the Hub | `--model`, `--repo-id` (both required), `--card-only`, `--public` |
+| `tune_batch.py` | Sweep batch size × context length for best throughput on this device | `--bs`, `--ctx`, `--steps`, `--warmup`, `--tol` |
+| `test_lora.py` | Sanity checks for LoRA / NF4 / merging | |
+
+Shared code lives in the `src/` package (scripts import it as `from src.utils import ...`; run scripts from the repo root): `src/utils.py` (train loop, checkpoints, loss, generation), `src/eval_common.py` (eval logic), `src/lora.py` (LoRA/QLoRA), `src/text_dataset.py` (datasets), `src/models.py`, `src/attention_utils.py`.
 
 ---
 
@@ -60,13 +71,17 @@ Forward returns logits `[batch, seq, vocab]`. Loss is token-level cross-entropy 
 
 See `TRANSFORMER.md` for a deeper attention walkthrough.
 
+### MoE variant (`GPT2MoEModel`)
+
+Same stack, but each block's MLP is replaced by a `MoeLayer`: a linear router picks the **top-k of N experts** per token (gate noise during training); each expert is a gated (SwiGLU-style) MLP. Defaults in `train_gpt2_moe_cosmopedia.py`: 8 experts, top-1, `expert_hidden_dim=768` → **275.6M total params, ~127M active per token**. Two auxiliary losses keep routing healthy: a load-balancing loss (`aux_loss_coef=0.01`) and a router z-loss (`z_loss_coef=0.001`). Router entropy and per-expert load are logged during training.
+
 ---
 
 ## Data
 
 ### Pretraining (language modeling)
 
-- **Cosmopedia** (`HuggingFaceTB/cosmopedia`, subset `stanford` by default)
+- **Cosmopedia** (`HuggingFaceTB/cosmopedia`): the dense model uses `stanford`; the MoE mixes `stanford, khanacademy, openstax, wikihow, auto_math_text, stories` (10,000 docs per subset)
 - Documents are shuffled, optionally capped (`max_samples`), split train/val, joined with `<|endoftext|>`, then cut into fixed windows (`TextDataset` with `context_length` / `stride`)
 - Targets are next-token shifts of the inputs (standard LM)
 
@@ -95,105 +110,147 @@ See `TRANSFORMER.md` for a deeper attention walkthrough.
 
 ## Pretrain
 
-Train a small GPT from scratch on Cosmopedia:
-
 ```bash
-uv run python train_gpt2_cosmopedia.py
+uv run python train_gpt2_cosmopedia.py        # dense  -> model-data/gpt-2-124m.pt
+uv run python train_gpt2_moe_cosmopedia.py    # MoE    -> model-data/gpt-2-moe-8x-mixed.pt
+# flags: --full (entire dataset, tokenised once into data-cache/), --no-wandb
 ```
 
-Defaults in that script:
+| Setting | Dense | MoE |
+|---------|-------|-----|
+| Context / stride | 64 / 64 | 64 / 64 |
+| Batch size · LR · epochs | 64 · `1e-4` AdamW · 2 | 64 · `1e-4` AdamW · 2 |
+| Data | 5,000 `stanford` docs | 10,000 docs × 6 subsets |
+| Train/val split | 90/10 of docs, seed 123 | same |
+| Checkpoint | `gpt-2-124m.pt` | `gpt-2-moe-8x-mixed.pt` |
 
-| Setting | Value | Notes |
-|---------|-------|-------|
-| Context / stride | 64 / 64 | Short windows for speed; raise for better LM |
-| Batch size | 8 | |
-| LR | `1e-4` AdamW | |
-| Epochs | 5 | |
-| Samples | 5000 of Cosmopedia stanford | Bump `max_samples` for a real run |
-| Checkpoint | `model-data/gpt-2-124m.pt` | Resumes automatically if present |
+**Strategy**
 
-**Strategy (pretrain)**
+1. Next-token CE on windowed text (MoE adds the aux + z losses)
+2. ~200 evals over the run (`eval_every`) on train/val loaders; a loss plot is saved next to the checkpoint
+3. Sample generation and a checkpoint (model + optimizer + losses + config) after each epoch — restart-safe; rerunning resumes
+4. Grad clip `1.0`; fused AdamW on CUDA/MPS
+5. **Ctrl+C once** pauses for an eval + sample then continues; **twice** aborts (progress since the last epoch checkpoint is lost)
 
-1. Next-token CE on windowed text
-2. Periodic eval on train/val loaders (`eval_freq` / `eval_iter`)
-3. Sample generation after each epoch
-4. Checkpoint after each full epoch (optimizer + losses + config) — restart-safe
-5. Grad clip `1.0` by default
-
-Expect weak prose at context 64 and 5k docs; this path is for learning the loop, not matching GPT-2 quality. Scale `context_length`, `max_samples`, and epochs when you have GPU time.
+Rename the model (`MODEL_NAME` in the script) to start a fresh checkpoint and W&B run for a new version.
 
 ---
 
 ## Fine-tune
 
-Two paths:
-
-### A. Fine-tune *your* Cosmopedia weights
+### A. Full fine-tune of *your* Cosmopedia weights
 
 ```bash
-# needs model-data/gpt-2-124m.pt from pretraining
-uv run python train_gpt2_gsm8k.py
+uv run python train_gpt2_gsm8k.py        # needs model-data/gpt-2-124m.pt -> gpt-2-124m-gsm8k.pt
 ```
 
-- Loads base weights with `load_pretrained_weights` (can extend context; position embeddings beyond the base length keep init)
-- Context bumped to **512**, LR lowered to **`5e-5`**, `qkv_bias=False`
-- Writes `model-data/gpt-2-124m-gsm8k.pt`
+Loads base weights with `load_pretrained_weights` (can extend context; position embeddings beyond the base length keep init), context **512**, LR `5e-5`.
 
 ### B. Fine-tune from OpenAI GPT-2
 
 ```bash
-uv run python train_openai_gpt2_gsm8k.py
+uv run python train_openai_gpt2_gsm8k.py # -> gpt2-openai-gsm8k.pt  (downloads openai-community/gpt2, qkv_bias=True)
 ```
 
-- Downloads HF `openai-community/gpt2` and maps weights into `GPTModel` (`qkv_bias=True`)
-- Same GSM8K SFT setup → `model-data/gpt2-openai-gsm8k.pt`
+Both use the instruction template + response-only loss, a smaller LR than pretraining and 3 epochs.
 
-**Strategy (fine-tune)**
+### C. LoRA / QLoRA
 
-1. Start from a pretrained LM (scratch Cosmopedia or OpenAI)
-2. Instruction template + response-only loss
-3. Smaller LR than pretrain; fewer epochs (default 3)
-4. Eval prompts use the chat template with an empty `### Response:` so the model continues as the assistant
-5. Same checkpoint/resume loop as pretrain
+```bash
+uv run python train_gpt2_lora_gsm8k.py            # -> gpt-2-124m-gsm8k-lora.pt
+uv run python train_gpt2_lora_gsm8k.py --qlora    # -> gpt-2-124m-gsm8k-qlora.pt
+uv run python eval_gpt2_lora_gsm8k.py [--qlora]   # base vs base+adapter vs merged on GSM8K test
+uv run python test_lora.py                        # sanity checks
+```
+
+`src/lora.py` is hand-rolled: `y = W x + (α/r)·B(A(dropout(x)))` with `A` Kaiming-init and `B = 0`, so training starts exactly at the base model. Defaults: `r=16, α=32, dropout=0.05`, applied to `W_q/W_k/W_v/out_proj` and both MLP layers, LR `2e-4`. The base is frozen; the position embeddings stay trainable because the 64→512 context extension leaves the new rows untrained.
+
+- **QLoRA** stores the frozen block weights as 4-bit **NF4** (blockwise absmax, pure PyTorch so it runs on MPS/CPU) and dequantises on the fly. On this 124M model it cuts MPS memory ~680 → ~400 MiB at the same speed; the payoff grows with model size. On CUDA, `bitsandbytes` would be faster.
+- Adapter checkpoints hold only the adapter + position embeddings (~12 MiB); the base is reloaded from `gpt-2-124m.pt`.
+- `merge_lora()` folds adapters into plain `Linear` weights (dequantising an NF4 base) for deployment; merged and adapter outputs match to ~1e-5.
+
+Not built yet: loading adapter checkpoints in `inference.py` (it only loads full checkpoints) and GGUF/llama.cpp export of the merged model.
+
+---
+
+## Evaluate
+
+```bash
+uv run python eval_gpt2_moe_cosmopedia.py     # evaluates gpt-2-moe-8x-mixed (no --model needed)
+uv run python eval_gpt2_cosmopedia.py         # evaluates gpt-2-124m
+# flags: --rows-per-subset N (default 50), --full, --dataset gsm8k, --model NAME, --prompt TEXT, --no-wandb
+```
+
+Each eval script scores its counterpart train script's checkpoint on **all six Cosmopedia subsets**: subsets the model trained on use held-out docs, the rest are random `unseen subset` docs. Output is per-subset and overall loss/perplexity (token-weighted), with `overall (held-out)` as the headline. Results go to `model-data/<model>-eval.json`, the W&B run (summary values, table, bar charts) and the Hub model card.
 
 ---
 
 ## Inference
 
 ```bash
-uv run python inference.py
 uv run python inference.py --list
 uv run python inference.py --model gpt-2-124m-gsm8k --mode chat
-uv run python inference.py --model gpt-2-124m --mode complete --max-new-tokens 100
+uv run python inference.py --model gpt-2-moe-8x-mixed --mode complete --max-new-tokens 100
+uv run python compare_generators.py --model gpt-2-moe-8x-mixed --subsets stanford khanacademy openstax wikihow auto_math_text stories
 ```
+
+`inference.py` is interactive (type `quit` to exit). `compare_generators.py` is non-interactive: it prints a held-out Cosmopedia doc, trims it to the first `--prefix-tokens` (default 10), then prints each generator's continuation (same seed per generator, `--temperature 0.8`). Pick another doc with `--index N`. `--subsets` must match the subsets the model trained on (default `stanford`; the MoE needs all six, as above) so the doc is truly held-out. Add a generator by putting it in the `GENERATORS` dict; it needs the signature `(model, idx, max_new_tokens, context_size, temperature=...)`.
+
 
 | Mode | Behavior |
 |------|----------|
 | `auto` (default) | `chat` if the checkpoint name contains `gsm8k` / `chat` / `sft`, else `complete` |
-| `chat` | Wraps each user turn in `CHAT_TEMPLATE`; independent Q&A (no multi-turn history) |
+| `chat` | Wraps each user turn in `CHAT_TEMPLATE`; independent Q&A |
 | `complete` | Raw continuation; history accumulates until you type `clear` |
 
-**Strategy (inference)**
+`inference.py` and the training-time samples use **greedy** decoding. `utils.py` also provides top-k and nucleus sampling, which `compare_generators.py` runs side by side on a held-out doc prefix.
 
-- Greedy argmax decoding (`generate_text_simple`) — deterministic, no sampling
-- Context cropped to the model’s `context_length`
-- Stops visually at `<|endoftext|>`; chat mode also cuts if a new `### Instruction:` appears
-- Device: CUDA → MPS → CPU
+---
 
-For creative sampling you’d add temperature / top-p in `generate_text_simple`; the training path currently uses greedy for eval samples too.
+## Experiment tracking (Weights & Biases)
+
+One W&B **project per train script** (`gpt2-cosmopedia`, `gpt2-moe-cosmopedia`, `gpt2-lora-gsm8k`); each model/version is a **run** whose id is the model name, so resuming a checkpoint resumes its run and eval scripts attach their results to the same run.
+
+Logged: full config (+ param counts, subsets, seed, device); every 10 steps train loss, CE loss (MoE), grad norm, clip flag, param norm, LR, tokens/s, epoch, device memory; per eval train/val loss, perplexity and gap; MoE aux/z loss, router entropy and per-expert load; per-epoch sample table and loss plot; final per-subset eval. Curves use a `step` axis so resumed epochs don't clash.
+
+---
+
+## Publish to the Hub
+
+```bash
+uv run python upload_to_hub.py --model gpt-2-moe-8x-mixed --repo-id USER/NAME [--public]
+uv run python upload_to_hub.py --model gpt-2-moe-8x-mixed --repo-id USER/NAME --card-only   # README only
+```
+
+Uploads weights (`pytorch_model.bin`), `config.json`, the loss plot and a generated model card whose `model-index` carries per-subset perplexity/loss as Hub eval results. Run the eval script first so the card has results.
+
+---
+
+## Tools
+
+```bash
+uv run python tune_batch.py [--bs 8 16 32] [--ctx 64 128] [--steps 5] [--warmup 2] [--tol 0.05]
+# sweeps batch × context in constant-tokens-per-step groups (8×64, 4×128, 2×256, then 16×64, ...)
+```
+
+Reports tokens/s per shape and the throughput optimum plus a "knee" (smallest tokens/step within 5% of best).
 
 ---
 
 ## Layout
 
 ```
-attention_utils.py   # MultiHeadAttention, FeedForward, LayerNorm, TransformerBlock
-models.py            # GPTModel
-text_dataset.py      # TextDataset, ChatDataset, dataloaders
-utils.py             # train loop, loss, checkpoints, weight loading, generation helpers
-inference.py         # CLI chat / completion
-train_gpt2_*.py      # entrypoints
-model-data/          # *.pt checkpoints (gitignored contents may vary)
+src/                     # importable package: `from src.<module> import ...`
+  attention_utils.py     # MultiHeadAttention, FeedForward, LayerNorm, TransformerBlock, Expert/MoeLayer/MOEBlock
+  models.py              # GPTModel, GPT2MoEModel (+ a stale GPT2LoraWrapper superseded by lora.py)
+  lora.py                # LoRALinear, NF4Linear, apply_lora, adapter save/load, merge_lora
+  text_dataset.py        # TextDataset, ChatDataset, Cosmopedia/GSM8K dataloaders
+  utils.py               # train loop, loss, checkpoints, W&B helpers, weight loading, generation
+  eval_common.py         # shared per-subset eval; eval_gpt2_*.py are thin wrappers
+train_*.py  eval_*.py    # entrypoints (repo root)
+inference.py  compare_generators.py  upload_to_hub.py  tune_batch.py  test_lora.py
+model-data/              # *.pt checkpoints, *-eval.json, *-losses.png (gitignored)
+data-cache/              # tokenised --full datasets
 ```
 
 ---
@@ -201,15 +258,12 @@ model-data/          # *.pt checkpoints (gitignored contents may vary)
 ## Typical workflow
 
 ```bash
-uv sync
-uv run python train_gpt2_cosmopedia.py      # → gpt-2-124m.pt
-uv run python train_gpt2_gsm8k.py           # → gpt-2-124m-gsm8k.pt
-uv run python inference.py --model gpt-2-124m-gsm8k --mode chat
-```
+uv sync && wandb login
+uv run python train_gpt2_moe_cosmopedia.py          # pretrain, tracked in W&B
+uv run python eval_gpt2_moe_cosmopedia.py           # per-subset eval -> W&B + eval json
+uv run python upload_to_hub.py --model gpt-2-moe-8x-mixed --repo-id USER/NAME
 
-Or skip scratch pretrain and go straight to OpenAI init + GSM8K:
-
-```bash
-uv run python train_openai_gpt2_gsm8k.py
-uv run python inference.py --model gpt2-openai-gsm8k
+uv run python train_gpt2_cosmopedia.py              # dense base
+uv run python train_gpt2_lora_gsm8k.py              # LoRA on GSM8K (add --qlora for 4-bit base)
+uv run python eval_gpt2_lora_gsm8k.py
 ```

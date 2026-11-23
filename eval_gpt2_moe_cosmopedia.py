@@ -1,4 +1,4 @@
-from eval_common import main_guard, run_eval
+from src.eval_common import main_guard, run_eval
 from train_gpt2_moe_cosmopedia import MAX_SAMPLES, MODEL_NAME, SUBSETS, WANDB_PROJECT
 
 

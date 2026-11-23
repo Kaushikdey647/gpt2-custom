@@ -11,7 +11,7 @@ import time
 
 import torch
 
-from utils import build_model, calc_loss_batch, get_device
+from src.utils import build_model, calc_loss_batch, get_device
 
 BASE_CONFIG = {
     "vocab_size": 50257,

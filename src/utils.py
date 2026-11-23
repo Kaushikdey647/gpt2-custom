@@ -12,8 +12,9 @@ from matplotlib.ticker import MaxNLocator
 import wandb
 from tqdm import tqdm
 
-from models import GPT2MoEModel, GPTModel
-from text_dataset import IGNORE_INDEX
+from .lora import adapter_state_dict, load_adapter_state_dict
+from .models import GPT2MoEModel, GPTModel
+from .text_dataset import IGNORE_INDEX
 
 
 def build_model(cfg):
@@ -107,14 +108,98 @@ def print_training_summary(model, cfg, device, train_loader, val_loader, model_n
 
 
 def generate_text_simple(model, idx, max_new_tokens, context_size, temperature=1.0):
+    '''
+    Greedy generation
+
+    Here we take the argmax of the logits, which gives us the most likely next token.
+    
+    This is good for base case, but may lead to robotic, repetitive or overly safe text.
+
+    Best for deterministic use cases though.
+    '''
     for _ in range(max_new_tokens):
         idx_cropped = idx[:, -context_size:]
         with torch.no_grad():
-            logits = model(idx_cropped)
-            logits = logits[:, -1, :] / temperature
+            logits = model(idx_cropped)[:, -1, :] / temperature
             probs = torch.softmax(logits, dim=-1)
             idx_next = torch.argmax(probs, dim=-1, keepdim=True)
             idx = torch.cat((idx, idx_next), dim=1)
+    return idx
+
+def generate_text_top_k_sampling(model, idx, max_new_tokens, context_size, temperature=1.0, k=50) -> torch.Tensor:
+    '''
+    Top-k sampling
+    
+    sampling introduces controlled randomness, which can lead to more creative and interesting text.
+    This it does by sampling from the top-k most likely tokens.
+
+    We set all other logits to -inf, and renormalize the top-k logits.
+
+    Then we sample with torch.multinomial.
+
+    Actually also this is like in between greedy and top-p sampling, so its unlikely we will ever use this lol.
+    '''
+    if temperature <= 0:
+        raise ValueError("Temperature must be greater than 0 for multinomial sampling.")
+    
+    for _ in range(max_new_tokens):
+        idx_cropped = idx[:, -context_size:]
+        with torch.no_grad():
+            logits = model(idx_cropped)[:,-1,:] / temperature
+        if k > 0:
+            vocab_size = logits.shape[-1]
+            effective_k = min(k, vocab_size)
+            kth_logit = torch.topk(logits, effective_k, dim=-1).values[:, -1:]
+            logits = logits.masked_fill(logits < kth_logit, float('-inf'))
+        probs = torch.softmax(logits, dim=-1)
+        idx_next = torch.multinomial(probs, num_samples=1)
+        idx = torch.cat((idx, idx_next), dim=1)
+    
+    return idx
+
+def generate_text_nucleus_sampling(model, idx, max_new_tokens, context_size, temperature=1.0, p=0.9):
+    '''
+    Nucleus sampling
+
+    Disadvantage of top-k sampling is that it uses a fixed cutoff, which can lead to misguided samples,
+    when the model is certain over first p tokens(p << k) but choses samples something else and the entire generation is ruined.
+
+    Here we sort the logits by probability and keep the top n tokens whose cumulative probability sums upto p.
+
+    This is also where temperature starts making a difference, since the cumulative probability will be affected.
+    '''
+
+    if temperature <= 0:
+        raise ValueError("Temperature must be greater than 0 for multinomial sampling.")
+    if not (0.0 < p <= 1.0):
+        raise ValueError("p must be between 0 and 1 for nucleus sampling.")
+    
+    for _ in range(max_new_tokens):
+        
+        idx_cropped = idx[:, -context_size:]
+
+        with torch.no_grad():
+            logits = model(idx_cropped)[:,-1,:] / temperature
+
+        if p < 1.0:
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+            sorted_probs = torch.softmax(sorted_logits, dim=-1)
+            cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+            # mask but keep the boundary tokens
+            tokens_to_remove = cumulative_probs > p
+            tokens_to_remove[:, 1:] = tokens_to_remove[:, :-1].clone()
+            tokens_to_remove[:, 0] = False
+
+            sorted_logits = sorted_logits.masked_fill(tokens_to_remove, float('-inf'))
+
+            logits = torch.empty_like(logits).scatter(
+                dim=-1, index=sorted_indices, src=sorted_logits
+            )
+        
+        probs = torch.softmax(logits, dim=-1)
+        idx_next = torch.multinomial(probs, num_samples=1)
+        idx = torch.cat((idx, idx_next), dim=1)
+
     return idx
 
 
@@ -236,7 +321,9 @@ def save_checkpoint(
             "epoch": epoch,
             "global_step": global_step,
             "tokens_seen": tokens_seen,
-            "model_state_dict": model.state_dict(),
+            # LoRA/QLoRA checkpoints hold only the adapters (+ modules_to_save); the base comes from its own checkpoint
+            "model_state_dict": adapter_state_dict(model) if getattr(model, "lora_cfg", None) else model.state_dict(),
+            "lora_cfg": getattr(model, "lora_cfg", None),
             "optimizer_state_dict": optimizer.state_dict(),
             "train_loss": train_loss,
             "val_loss": val_loss,
@@ -261,7 +348,10 @@ def load_checkpoint(path, model, optimizer, device, config=None):
                     f"Checkpoint config mismatch for {key}: "
                     f"{checkpoint['config'][key]} vs {config.get(key)}"
                 )
-    model.load_state_dict(checkpoint["model_state_dict"])
+    if checkpoint.get("lora_cfg"):
+        load_adapter_state_dict(model, checkpoint["model_state_dict"])
+    else:
+        model.load_state_dict(checkpoint["model_state_dict"])
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     for state in optimizer.state.values():
         for k, v in state.items():
