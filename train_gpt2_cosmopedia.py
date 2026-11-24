@@ -16,10 +16,10 @@ from src.utils import (
     train_model_simple,
 )
 
-MODEL_NAME = "gpt-2-124m"
+MODEL_NAME = "gpt-2-124m-v2-all-subsets"
 WANDB_PROJECT = "gpt2-cosmopedia"  # one project per train script; each model/version is a run in it
-SUBSETS = ["stanford"]
-MAX_SAMPLES = 5000
+MAX_SAMPLES = 10000
+SUBSETS = ["stanford", "khanacademy", "openstax", "wikihow", "auto_math_text", "stories"]
 EVAL_ITER = 10
 
 
@@ -31,14 +31,14 @@ def main():
 
     GPT_CONFIG_124M = {
         "vocab_size": 50257,
-        "context_length": 64,
+        "context_length": 128,
         "stride": 64,
         "embedding_dim": 768,
         "num_heads": 12,
         "num_layers": 12,
         "dropout_rate": 0.1,
         "qkv_bias": False,
-        "batch_size": 64,
+        "batch_size": 32,
         "learning_rate": 1e-4,
         "num_epochs": 2,
         "start_context": "In this chapter",

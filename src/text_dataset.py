@@ -1,3 +1,4 @@
+import itertools
 import os
 import random
 
@@ -5,7 +6,7 @@ import numpy as np
 import tiktoken
 import torch
 from datasets import concatenate_datasets, load_dataset
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import ConcatDataset, DataLoader, Dataset
 
 IGNORE_INDEX = -100
 
@@ -329,23 +330,46 @@ def create_dataloader_cosmopedia(
     return train_loader, val_loader
 
 
-def _tokenize_to_bin(texts, path, batch_size=10_000):
-    """Tokenize an iterable of docs (<|endoftext|> after each) into a uint16 file."""
+def _tokenize_to_bin(texts, path, batch_size=10_000, max_tokens=None):
+    """Tokenize an iterable of docs (<|endoftext|> after each) into a uint16 file.
+
+    max_tokens stops (truncating the last doc) once that many tokens are written; `texts` may be
+    a shared iterator so a later call continues where this one stopped.
+    """
     tokenizer = tiktoken.get_encoding("gpt2")
     eot = tokenizer.eot_token
     tmp = path + ".tmp"
+    written = 0
+    done = False
+    if max_tokens is not None:
+        batch_size = max(1, min(batch_size, max_tokens // 2000))  # don't read far past a small budget
+
+    def flush(f, batch):
+        nonlocal written, done
+        for ids in tokenizer.encode_ordinary_batch(batch):
+            ids = ids + [eot]
+            if max_tokens is not None and written + len(ids) >= max_tokens:
+                ids = ids[: max_tokens - written]
+                done = True
+            np.array(ids, dtype=np.uint16).tofile(f)
+            written += len(ids)
+            if done:
+                return
+
     with open(tmp, "wb") as f:
         batch = []
         for i, text in enumerate(texts, 1):
             batch.append(text)
             if len(batch) == batch_size:
-                for ids in tokenizer.encode_ordinary_batch(batch):
-                    np.array(ids + [eot], dtype=np.uint16).tofile(f)
+                flush(f, batch)
                 batch = []
-                print(f"Tokenized {i} docs -> {path}")
-        for ids in tokenizer.encode_ordinary_batch(batch):
-            np.array(ids + [eot], dtype=np.uint16).tofile(f)
+                print(f"Tokenized {i} docs ({written:,} tokens) -> {path}")
+                if done:
+                    break
+        if batch and not done:
+            flush(f, batch)
     os.replace(tmp, path)
+    return written
 
 
 def create_dataloader_cosmopedia_full(
@@ -423,4 +447,65 @@ def create_dataloader_gsm8k(config: dict):
     val_ds = ChatDataset(raw["test"], tokenizer, max_length)
     train_loader = DataLoader(train_ds, batch_size=config["batch_size"], shuffle=True, num_workers=0, drop_last=True)
     val_loader = DataLoader(val_ds, batch_size=config["batch_size"], shuffle=False, num_workers=0, drop_last=False)
+    return train_loader, val_loader
+
+
+def _stream(path, column="text", buffer_size=1_000, **kw):
+    def make(seed):
+        ds = load_dataset(path, split="train", streaming=True, **kw)
+        return (r[column] for r in ds.shuffle(seed=seed, buffer_size=buffer_size))
+
+    return make
+
+
+def _stream_cosmopedia(seed, subsets=("stanford", "khanacademy", "openstax", "wikihow", "auto_math_text", "stories")):
+    return itertools.chain.from_iterable(_stream("HuggingFaceTB/cosmopedia", name=s)(seed) for s in subsets)
+
+
+# name -> (share of token budget, stream factory(seed) -> text iterator, tokenize batch size).
+# Shares sum to 1; books are whole volumes so they use small batches.
+MIXED_SOURCES = {
+    "fineweb": (0.40, _stream("HuggingFaceFW/fineweb", name="sample-10BT"), 10_000),
+    "fineweb-edu": (0.25, _stream("HuggingFaceFW/fineweb-edu", name="sample-10BT"), 10_000),
+    "cosmopedia": (0.20, _stream_cosmopedia, 10_000),
+    "books": (0.10, _stream("emozilla/pg19", buffer_size=8), 16),  # small buffer: each doc is a whole book
+    "wikipedia": (0.025, _stream("wikimedia/wikipedia", name="20231101.en"), 1_000),
+    "code": (0.025, _stream("codeparrot/codeparrot-clean", column="content"), 1_000),
+}
+
+
+def create_dataloader_mixed(
+    config: dict,
+    total_tokens: int = 1_000_000_000,
+    val_tokens: int = 2_000_000,
+    seed: int = 123,
+    cache_dir: str = "data-cache",
+    sources: dict = None,
+):
+    """Loaders over a weighted corpus mix (see MIXED_SOURCES), sized by token budget.
+
+    Each source is streamed, tokenized once into train/val .bin files under cache_dir (budget =
+    share * total_tokens; val = share * val_tokens), then memory-mapped. Train windows are shuffled
+    across sources by the DataLoader. Changing total_tokens/val_tokens re-tokenizes.
+    """
+    sources = sources or MIXED_SOURCES
+    os.makedirs(cache_dir, exist_ok=True)
+    train_parts, val_parts = [], []
+    for name, (share, make, batch_size) in sources.items():
+        paths = {
+            k: os.path.join(cache_dir, f"mix-{name}-{total_tokens}-{val_tokens}-{k}.bin") for k in ("train", "val")
+        }
+        if not all(os.path.exists(p) for p in paths.values()):
+            texts = make(seed)
+            _tokenize_to_bin(texts, paths["val"], batch_size, max_tokens=int(share * val_tokens))
+            _tokenize_to_bin(texts, paths["train"], batch_size, max_tokens=int(share * total_tokens))
+        for key, parts in (("train", train_parts), ("val", val_parts)):
+            parts.append(MemmapDataset(paths[key], config["context_length"], config["stride"]))
+
+    train_loader = DataLoader(
+        ConcatDataset(train_parts), batch_size=config["batch_size"], shuffle=True, num_workers=0, drop_last=True
+    )
+    val_loader = DataLoader(
+        ConcatDataset(val_parts), batch_size=config["batch_size"], shuffle=False, num_workers=0, drop_last=False
+    )
     return train_loader, val_loader

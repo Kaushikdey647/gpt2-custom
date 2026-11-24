@@ -18,11 +18,12 @@ from src.utils import (
 
 
 # Cosmopedia configs mixed for training (max_samples applies per subset in the non-full run)
-MODEL_NAME = "gpt-2-moe-8x-mixed"  # new name so the old stanford-only checkpoint isn't resumed
-WANDB_PROJECT = "gpt2-moe-cosmopedia"  # one project per train script; each model/version is a run in it
+MODEL_NAME = "gpt-2-moe-8x-v2-all-subsets"  # new name so the old stanford-only checkpoint isn't resumed
+WANDB_PROJECT = "gpt2-cosmopedia"  # one project per train script; each model/version is a run in it
 EVAL_ITER = 10
 MAX_SAMPLES = 10000
 SUBSETS = ["stanford", "khanacademy", "openstax", "wikihow", "auto_math_text", "stories"]
+
 
 
 def main():
@@ -33,14 +34,14 @@ def main():
 
     GPT_CONFIG_MOE = {
         "vocab_size": 50257,
-        "context_length": 64,
+        "context_length": 128,
         "stride": 64,
         "embedding_dim": 768,
         "num_heads": 12,
         "num_layers": 12,
         "dropout_rate": 0.1,
         "qkv_bias": False,
-        "batch_size": 64,
+        "batch_size": 32,
         "learning_rate": 1e-4,
         "num_epochs": 2,
         "start_context": "In this chapter",
